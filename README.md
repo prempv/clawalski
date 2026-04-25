@@ -4,19 +4,17 @@ Path-addressed Telegram bot gateway to [Claude Code](https://docs.anthropic.com/
 
 ## Install
 
-Installed from GitHub (no npm registry) using `npm` (or `pnpm`):
+Install latest from GitHub via the tarball URL (npm has a known bug with `git+…` URLs and native install hooks; the tarball form works around it):
 
 ```bash
-npm i -g git+https://github.com/prempv/clawalski
+npm i -g https://github.com/prempv/clawalski/archive/refs/heads/master.tar.gz
 ```
 
 Pin to a tag:
 
 ```bash
-npm i -g git+https://github.com/prempv/clawalski#v0.1.0
+npm i -g https://github.com/prempv/clawalski/archive/refs/tags/v0.1.0.tar.gz
 ```
-
-`pnpm add -g …` works too, but requires `pnpm setup` to have been run first on the machine.
 
 ### Prerequisites
 

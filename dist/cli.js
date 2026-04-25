@@ -3704,16 +3704,17 @@ async function serviceCommand(argv) {
 }
 //#endregion
 //#region src/cli/commands/update.ts
+const LATEST_TARBALL = "https://github.com/prempv/clawalski/archive/refs/heads/master.tar.gz";
 async function updateCommand(_argv) {
 	if (spawnSync("which", ["npm"], { encoding: "utf-8" }).status !== 0) {
 		console.error("npm not found on PATH. Install Node/npm to use `clawalski update`.");
 		return 1;
 	}
-	console.log("Upgrading via `npm i -g git+https://github.com/prempv/clawalski`...");
+	console.log(`Upgrading via \`npm i -g ${LATEST_TARBALL}\`...`);
 	return spawnSync("npm", [
 		"i",
 		"-g",
-		"git+https://github.com/prempv/clawalski"
+		LATEST_TARBALL
 	], { stdio: "inherit" }).status ?? 0;
 }
 //#endregion

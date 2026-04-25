@@ -1,5 +1,8 @@
 import { spawnSync } from "node:child_process";
 
+const LATEST_TARBALL =
+	"https://github.com/prempv/clawalski/archive/refs/heads/master.tar.gz";
+
 export async function updateCommand(_argv: string[]): Promise<number> {
 	const which = spawnSync("which", ["npm"], { encoding: "utf-8" });
 	if (which.status !== 0) {
@@ -8,13 +11,7 @@ export async function updateCommand(_argv: string[]): Promise<number> {
 		);
 		return 1;
 	}
-	console.log(
-		"Upgrading via `npm i -g git+https://github.com/prempv/clawalski`...",
-	);
-	const r = spawnSync(
-		"npm",
-		["i", "-g", "git+https://github.com/prempv/clawalski"],
-		{ stdio: "inherit" },
-	);
+	console.log(`Upgrading via \`npm i -g ${LATEST_TARBALL}\`...`);
+	const r = spawnSync("npm", ["i", "-g", LATEST_TARBALL], { stdio: "inherit" });
 	return r.status ?? 0;
 }
