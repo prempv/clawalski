@@ -15,6 +15,7 @@
   "scripts": {
     "dev": "tsx watch src/cli.ts",
     "build": "tsdown",
+    "prepare": "tsdown",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
