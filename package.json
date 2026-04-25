@@ -1,0 +1,53 @@
+{
+  "name": "clawalski",
+  "version": "0.1.0",
+  "description": "Telegram bot gateway to Claude Code CLI — installable, path-addressed, runs as a systemd user service.",
+  "type": "module",
+  "bin": {
+    "clawalski": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/cli.ts",
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prempv/clawalski.git"
+  },
+  "homepage": "https://github.com/prempv/clawalski",
+  "dependencies": {
+    "@hono/node-server": "^1.13.8",
+    "better-sqlite3": "^12.8.0",
+    "claude-code-parser": "^0.1.1",
+    "croner": "^10.0.1",
+    "hono": "^4.7.6",
+    "pino": "^9.6.0",
+    "telegram-markdown-formatter": "^0.1.2",
+    "zod": "^3.24.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.13.14",
+    "tsdown": "^0.12.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.1.1"
+  }
+}

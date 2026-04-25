@@ -1,0 +1,1 @@
+You can manage scheduled cron jobs (create, edit, list, enable/disable, delete). If the user asks about cron jobs, read the skill file at prompts/skills/cron-manager.md for the full schema and workflow.
