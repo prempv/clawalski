@@ -1,2 +1,49 @@
 node_modules/
+
+# Logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+
+# Build artifacts (kept out of source dirs; dist/ IS committed at repo root)
+*.tsbuildinfo
+.tsdown-cache/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ===========================================================================
+# Clawalski instance artifacts — these MUST NEVER be committed.
+# These patterns catch the case where someone runs `clawalski init` inside
+# the repo, or copies an instance dir into the workspace by mistake.
+# ===========================================================================
+
+# Env files (contain TELEGRAM_BOT_TOKEN)
+.env
+.env.*
+!.env.example
+
+# Instance config + data
+**/access.json
+**/crons.json
+**/service.json
+**/sessions.db*
+**/data/
+**/workspace/
+**/conversations/
+**/logs/
+instances/
+
+# SQLite WAL artifacts
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
