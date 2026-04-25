@@ -4,22 +4,24 @@ Path-addressed Telegram bot gateway to [Claude Code](https://docs.anthropic.com/
 
 ## Install
 
-Installed from GitHub (no npm registry) using [pnpm](https://pnpm.io):
+Installed from GitHub (no npm registry) using `npm` (or `pnpm`):
 
 ```bash
-pnpm add -g git+https://github.com/prempv/clawalski
+npm i -g git+https://github.com/prempv/clawalski
 ```
 
 Pin to a tag:
 
 ```bash
-pnpm add -g git+https://github.com/prempv/clawalski#v0.1.0
+npm i -g git+https://github.com/prempv/clawalski#v0.1.0
 ```
+
+`pnpm add -g …` works too, but requires `pnpm setup` to have been run first on the machine.
 
 ### Prerequisites
 
 - Node ≥ 22
-- `pnpm` on `PATH`
+- `npm` on `PATH`
 - A C toolchain for `better-sqlite3`'s native build: `python3`, `make`, `gcc` (Linux). On Arch: `base-devel`. On Debian/Ubuntu: `build-essential python3`.
 
 ## Quick start

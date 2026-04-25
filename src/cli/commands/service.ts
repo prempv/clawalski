@@ -117,7 +117,7 @@ async function install(argv: string[]): Promise<number> {
 	const bin = which("clawalski");
 	if (!bin) {
 		console.error(
-			"clawalski not found on PATH. Install globally first:\n  pnpm add -g git+https://github.com/prempv/clawalski",
+			"clawalski not found on PATH. Install globally first:\n  npm i -g git+https://github.com/prempv/clawalski",
 		);
 		return 1;
 	}
