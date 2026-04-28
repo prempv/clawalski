@@ -3615,7 +3615,7 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-NotifyAccess=main
+NotifyAccess=all
 Environment="PATH=${unitPath(bin)}"
 ExecStart=${bin} run ${root}
 WorkingDirectory=${root}
