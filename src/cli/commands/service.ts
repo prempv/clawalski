@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	type InstancePaths,
 	assertInstanceReady,
@@ -36,6 +36,18 @@ function systemctl(args: string[]): { code: number; output: string } {
 	return { code: r.status ?? 0, output: (r.stdout ?? "") + (r.stderr ?? "") };
 }
 
+function unitPath(bin: string): string {
+	const dirs = new Set<string>();
+	dirs.add(dirname(bin));
+	const home = homedir();
+	dirs.add(join(home, ".local/bin"));
+	for (const d of (process.env.PATH ?? "").split(":")) {
+		if (d) dirs.add(d);
+	}
+	for (const d of ["/usr/local/bin", "/usr/bin", "/bin"]) dirs.add(d);
+	return Array.from(dirs).join(":");
+}
+
 function unitContent(name: string, root: string, bin: string): string {
 	return `[Unit]
 Description=Clawalski (${name}) — ${root}
@@ -43,7 +55,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
+Environment="PATH=${unitPath(bin)}"
 ExecStart=${bin} run ${root}
 WorkingDirectory=${root}
 EnvironmentFile=${root}/config/.env

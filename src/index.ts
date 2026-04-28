@@ -35,6 +35,11 @@ import { createLogger } from "./logger.js";
 import { startPolling } from "./poller.js";
 import { createApp } from "./server.js";
 import { createSessionStore } from "./session-store.js";
+import {
+	notifyReady,
+	notifyStopping,
+	startWatchdog,
+} from "./systemd-notify.js";
 import { TelegramClient } from "./telegram-client.js";
 
 export interface RunInstanceOptions {
@@ -172,10 +177,13 @@ export async function runInstance({
 	};
 
 	const ac = new AbortController();
+	const stopWatchdog = startWatchdog(log);
 
 	for (const sig of ["SIGINT", "SIGTERM"] as const) {
 		process.on(sig, () => {
 			log.info({ signal: sig }, "shutting down");
+			notifyStopping();
+			stopWatchdog();
 			ac.abort();
 			cronScheduler.stop();
 			backends.closeAll();
@@ -184,6 +192,8 @@ export async function runInstance({
 			closeLogger();
 		});
 	}
+
+	notifyReady();
 
 	if (config.mode === "webhook") {
 		await runWebhook(client, log, config, ac, handlerOpts, startedAt);

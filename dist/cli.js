@@ -3242,6 +3242,36 @@ function createSessionStore(dbPath) {
 	};
 }
 //#endregion
+//#region src/systemd-notify.ts
+function send(state) {
+	if (!process.env.NOTIFY_SOCKET) return;
+	spawn("systemd-notify", [state], {
+		stdio: "ignore",
+		detached: false
+	}).on("error", () => {});
+}
+function notifyReady() {
+	send("READY=1");
+}
+function notifyStopping() {
+	send("STOPPING=1");
+}
+function startWatchdog(log) {
+	const usec = process.env.WATCHDOG_USEC;
+	if (!process.env.NOTIFY_SOCKET || !usec) return () => {};
+	const timeoutMs = Number(usec) / 1e3;
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return () => {};
+	const intervalMs = Math.max(5e3, Math.floor(timeoutMs / 2));
+	log.info({
+		timeoutMs,
+		intervalMs
+	}, "systemd watchdog enabled — sending periodic WATCHDOG=1");
+	send("WATCHDOG=1");
+	const id = setInterval(() => send("WATCHDOG=1"), intervalMs);
+	id.unref?.();
+	return () => clearInterval(id);
+}
+//#endregion
 //#region src/telegram-client.ts
 const TELEGRAM_API = "https://api.telegram.org";
 const MAX_RATE_LIMIT_RETRIES = 3;
@@ -3445,8 +3475,11 @@ async function runInstance({ instancePath }) {
 		conversationLogDir
 	};
 	const ac = new AbortController();
+	const stopWatchdog = startWatchdog(log);
 	for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => {
 		log.info({ signal: sig }, "shutting down");
+		notifyStopping();
+		stopWatchdog();
 		ac.abort();
 		cronScheduler.stop();
 		backends.closeAll();
@@ -3454,6 +3487,7 @@ async function runInstance({ instancePath }) {
 		db.close();
 		closeLogger();
 	});
+	notifyReady();
 	if (config.mode === "webhook") await runWebhook(client, log, config, ac, handlerOpts, startedAt);
 	else {
 		await client.deleteWebhook();
@@ -3560,6 +3594,19 @@ function systemctl(args) {
 		output: (r.stdout ?? "") + (r.stderr ?? "")
 	};
 }
+function unitPath(bin) {
+	const dirs = /* @__PURE__ */ new Set();
+	dirs.add(dirname(bin));
+	const home = homedir();
+	dirs.add(join(home, ".local/bin"));
+	for (const d of (process.env.PATH ?? "").split(":")) if (d) dirs.add(d);
+	for (const d of [
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin"
+	]) dirs.add(d);
+	return Array.from(dirs).join(":");
+}
 function unitContent(name, root, bin) {
 	return `[Unit]
 Description=Clawalski (${name}) — ${root}
@@ -3567,7 +3614,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
+Environment="PATH=${unitPath(bin)}"
 ExecStart=${bin} run ${root}
 WorkingDirectory=${root}
 EnvironmentFile=${root}/config/.env
