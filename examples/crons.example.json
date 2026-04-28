@@ -1,0 +1,84 @@
+{
+  "jobs": [
+    {
+      "id": "standup-v1",
+      "name": "standup",
+      "enabled": true,
+      "schedule": "0 9 * * 1-5",
+      "timezone": "America/New_York",
+      "prompt": "Review the git log from the last 24 hours and write a standup summary.",
+      "chatId": 123456789,
+      "threadId": 15,
+      "failureAlertChatId": 987654321,
+      "systemPrompt": "You are a dev team assistant. Be concise.",
+      "workingDir": "/home/dev/work/my-project",
+      "model": "sonnet"
+    },
+    {
+      "id": "weekly-review-v1",
+      "name": "weekly-review",
+      "enabled": true,
+      "schedule": "0 10 * * 1",
+      "timezone": "America/New_York",
+      "promptFile": "./prompts/weekly-review.md",
+      "chatId": 123456789,
+      "threadId": 42,
+      "failureAlertChatId": 987654321,
+      "systemPrompt": "You are a senior engineer performing a weekly code review. Focus on patterns, tech debt, and missed tests.",
+      "workingDir": "/home/dev/work/my-project",
+      "model": "opus"
+    },
+    {
+      "id": "dep-audit-v1",
+      "name": "dep-audit",
+      "enabled": true,
+      "schedule": "0 6 * * 3",
+      "timezone": "US/Pacific",
+      "prompt": "Run `pnpm audit` and `pnpm outdated`. Summarize any critical vulnerabilities and major version bumps available. Recommend which to upgrade now vs later.",
+      "chatId": 123456789,
+      "threadId": 88,
+      "failureAlertChatId": 987654321,
+      "systemPrompt": "You are a security-focused DevOps engineer. Flag CVEs by severity. Be direct.",
+      "workingDir": "/home/dev/work/my-project",
+      "model": "sonnet"
+    },
+    {
+      "id": "health-check-v1",
+      "name": "health-check",
+      "enabled": true,
+      "schedule": "*/5 * * * *",
+      "prompt": "Check the system status and report any issues.",
+      "chatId": 123456789,
+      "failureAlertChatId": 987654321,
+      "systemPrompt": "You are a monitoring agent. Only report problems. If everything is healthy, say 'All clear' and nothing else.",
+      "workingDir": "/home/dev/work/infra",
+      "model": "haiku"
+    },
+    {
+      "id": "changelog-v1",
+      "name": "changelog",
+      "enabled": true,
+      "schedule": "0 18 * * 5",
+      "timezone": "America/New_York",
+      "promptFile": "./prompts/changelog.md",
+      "chatId": 123456789,
+      "threadId": 200,
+      "failureAlertChatId": 987654321,
+      "systemPrompt": "You are a technical writer. Generate a user-facing changelog from this week's commits. Group by feature, fix, and chore. Skip merge commits.",
+      "workingDir": "/home/dev/work/my-project",
+      "model": "sonnet"
+    },
+    {
+      "id": "nightly-report-v1",
+      "name": "nightly-report",
+      "enabled": false,
+      "schedule": "0 23 * * *",
+      "timezone": "UTC",
+      "prompt": "Generate the nightly activity report covering all commits, deployments, and open PRs.",
+      "failureAlertChatId": 987654321,
+      "systemPrompt": "You are a project manager bot. Be thorough but structured. Use bullet points.",
+      "workingDir": "/home/dev/work/my-project",
+      "model": "opus"
+    }
+  ]
+}

@@ -1,7 +1,9 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { stdin, stdout } from "node:process";
 import * as readline from "node:readline/promises";
-import { resolveInstancePaths } from "../instance.js";
+import { fileURLToPath } from "node:url";
+import { type InstancePaths, resolveInstancePaths } from "../instance.js";
 
 interface InitArgs {
 	path: string;
@@ -32,6 +34,35 @@ function parseInitArgs(argv: string[]): InitArgs | { error: string } {
 	}
 	if (!path) return { error: "Path is required: clawalski init <path>" };
 	return { path, token, adminChatId, noInteractive };
+}
+
+function findExamplesDir(): string | null {
+	let dir = dirname(fileURLToPath(import.meta.url));
+	for (let i = 0; i < 12; i++) {
+		const candidate = join(dir, "examples");
+		if (existsSync(candidate) && existsSync(join(dir, "package.json"))) {
+			return candidate;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
+	return null;
+}
+
+function seedExamples(paths: InstancePaths): void {
+	const examples = findExamplesDir();
+	if (!examples) return;
+
+	const promptsSrc = join(examples, "prompts");
+	if (existsSync(promptsSrc)) {
+		cpSync(promptsSrc, paths.promptsDir, { recursive: true });
+	}
+
+	const cronsExampleSrc = join(examples, "crons.example.json");
+	if (existsSync(cronsExampleSrc)) {
+		cpSync(cronsExampleSrc, join(paths.configDir, "crons.example.json"));
+	}
 }
 
 async function promptToken(): Promise<string> {
@@ -89,10 +120,15 @@ export async function initCommand(argv: string[]): Promise<number> {
 
 	writeFileSync(paths.cronFile, `${JSON.stringify({ jobs: [] }, null, 2)}\n`);
 
+	seedExamples(paths);
+
 	console.log(`Scaffolded clawalski instance at ${paths.root}`);
 	console.log("Next steps:");
 	console.log(
 		`  - Edit ${paths.accessFile} (set allowedUsers / allowedGroups)`,
+	);
+	console.log(
+		`  - Schedule jobs in ${paths.cronFile} (templates in ${paths.configDir}/crons.example.json)`,
 	);
 	console.log(`  - Run: clawalski run ${paths.root}`);
 	console.log(
