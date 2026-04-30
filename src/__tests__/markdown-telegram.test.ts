@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { splitHtml } from "../markdown-telegram.js";
+import { markdownToTelegramHtml, splitHtml } from "../markdown-telegram.js";
 
 const MAX = 4096;
 
@@ -109,5 +109,33 @@ describe("splitHtml", () => {
 		for (const c of chunks) {
 			expect(isBalanced(c)).toBe(true);
 		}
+	});
+});
+
+describe("markdownToTelegramHtml", () => {
+	it("converts single-backtick inline code", () => {
+		expect(markdownToTelegramHtml("see `foo` now")).toBe(
+			"see <code>foo</code> now",
+		);
+	});
+
+	it("collapses double-backtick inline code without leaking literals", () => {
+		expect(
+			markdownToTelegramHtml("path: ``/home/dev/work/bots/optimus``."),
+		).toBe("path: <code>/home/dev/work/bots/optimus</code>.");
+	});
+
+	it("leaves fenced code blocks untouched", () => {
+		const out = markdownToTelegramHtml("```\nhello\n```");
+		expect(out).toContain("<pre>");
+		expect(out).toContain("hello");
+		expect(out).not.toMatch(/^`/);
+	});
+
+	it("does not collapse double-backticks containing a backtick", () => {
+		// Legitimate use of double-backticks: the inner content has a single
+		// backtick that would otherwise need escaping. Leave alone.
+		const input = "see ``a ` b`` here";
+		expect(markdownToTelegramHtml(input)).not.toMatch(/<code>a ` b<\/code>/);
 	});
 });

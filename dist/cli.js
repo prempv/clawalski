@@ -1510,7 +1510,10 @@ const TRACKED_TAGS = new Set([
 * Returns the raw text unchanged if conversion produces an empty result.
 */
 function markdownToTelegramHtml(markdown) {
-	return telegramFormat(markdown) || markdown;
+	return telegramFormat(normalizeInlineCode(markdown)) || markdown;
+}
+function normalizeInlineCode(markdown) {
+	return markdown.replace(/``([^`\n]+)``/g, "`$1`");
 }
 /**
 * Split an HTML string into chunks that fit within Telegram's 4096-char limit.

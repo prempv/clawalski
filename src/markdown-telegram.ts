@@ -18,8 +18,17 @@ const TRACKED_TAGS = new Set([
  * Returns the raw text unchanged if conversion produces an empty result.
  */
 export function markdownToTelegramHtml(markdown: string): string {
-	const html = telegramFormat(markdown);
+	const html = telegramFormat(normalizeInlineCode(markdown));
 	return html || markdown;
+}
+
+// telegram-markdown-formatter only recognises single-backtick inline code;
+// CommonMark double-backtick spans (e.g. ``foo``) are emitted by Claude when
+// content might contain a backtick. The formatter wraps the inner text in
+// <code> but leaves the outer backticks as literals — collapse the no-conflict
+// case to single backticks so the literal characters don't reach Telegram.
+function normalizeInlineCode(markdown: string): string {
+	return markdown.replace(/``([^`\n]+)``/g, "`$1`");
 }
 
 /**
