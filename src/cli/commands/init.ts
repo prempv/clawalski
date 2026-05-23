@@ -63,6 +63,11 @@ function seedExamples(paths: InstancePaths): void {
 	if (existsSync(cronsExampleSrc)) {
 		cpSync(cronsExampleSrc, join(paths.configDir, "crons.example.json"));
 	}
+
+	const bindingsExampleSrc = join(examples, "bindings.example.json");
+	if (existsSync(bindingsExampleSrc)) {
+		cpSync(bindingsExampleSrc, join(paths.configDir, "bindings.example.json"));
+	}
 }
 
 async function promptToken(): Promise<string> {
@@ -129,6 +134,9 @@ export async function initCommand(argv: string[]): Promise<number> {
 	);
 	console.log(
 		`  - Schedule jobs in ${paths.cronFile} (templates in ${paths.configDir}/crons.example.json)`,
+	);
+	console.log(
+		`  - Bind topics to repos in ${paths.configDir}/bindings.json (template: ${paths.configDir}/bindings.example.json)`,
 	);
 	console.log(`  - Run: clawalski run ${paths.root}`);
 	console.log(

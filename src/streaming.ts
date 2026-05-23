@@ -37,7 +37,23 @@ export async function streamToTelegram(
 	events: AsyncIterable<ClaudeStreamEvent>,
 	log: Logger,
 	timer?: RequestTimer,
+	onEvent?: (event: ClaudeStreamEvent) => void,
 ): Promise<StreamResult> {
+	log.info(
+		{
+			chatId: ctx.chatId,
+			threadId: ctx.messageThreadId,
+			replyToMessageId: ctx.replyToMessageId,
+		},
+		"stream started",
+	);
+
+	// Activity-driven typing: only send a typing indicator while we're seeing
+	// recent events from the model. A long-lived forwarder may sit on a
+	// quiescent stream for minutes between user inputs — we don't want a
+	// constant "typing..." in those gaps.
+	const TYPING_STALE_MS = TYPING_INTERVAL_MS * 2;
+	let lastEventAt = 0;
 	const sendTyping = () =>
 		client
 			.sendChatAction({
@@ -50,20 +66,31 @@ export async function streamToTelegram(
 			.catch(() => {});
 
 	await sendTyping();
-	const typingInterval = setInterval(sendTyping, TYPING_INTERVAL_MS);
+	lastEventAt = Date.now();
+	const typingInterval = setInterval(() => {
+		if (Date.now() - lastEventAt < TYPING_STALE_MS) sendTyping();
+	}, TYPING_INTERVAL_MS);
 
+	// Per-turn state — reset every time we receive `turn_complete`. Each
+	// agent-loop step (including auto-continuations the CLI kicks off after
+	// background-task notifications) becomes its own Telegram bubble.
 	let messageId: number | null = null;
-	let accumulatedText = "";
-	const textSegments: string[] = [];
+	let turnText = "";
+	let textSegments: string[] = [];
 	let currentSegment = "";
 	let lastEditText = "";
 	let lastEditTime = 0;
 	let currentTool = "";
-	const toolHistory: string[] = [];
+	let turnTools: string[] = [];
+	let afterToolResult = false;
+
+	// Aggregate state — preserved across turns and returned to the handler
+	// (for the conversation log + session stats).
+	let aggregateText = "";
+	const aggregateTools: string[] = [];
 	let sessionId: string | null = null;
 	let errorText: string | null = null;
 	let firstTokenMarked = false;
-	let afterToolResult = false;
 	let costUsd: number | null = null;
 	let inputTokens: number | null = null;
 	let outputTokens: number | null = null;
@@ -72,10 +99,60 @@ export async function streamToTelegram(
 	let completed = false;
 	let interrupted = false;
 
+	const finalizeTurn = async (): Promise<void> => {
+		// Flush whatever is accumulated for this turn into a Telegram bubble.
+		// Called on every `turn_complete` and once more after the loop in case
+		// the iterator ended without a final turn_complete (codex / process
+		// death / interruption).
+		if (currentSegment) {
+			textSegments.push(currentSegment);
+			currentSegment = "";
+		}
+		if (textSegments.length === 0 && !errorText && !interrupted) return;
+
+		let finalText: string;
+		let finalSegments: string[];
+		if (errorText) {
+			finalText = turnText
+				? `${truncate(turnText)}\n\n[Error: ${errorText}]`
+				: `Error: ${errorText}`;
+			finalSegments = [finalText];
+		} else if (interrupted && textSegments.length === 0) {
+			finalText = STREAM_INTERRUPTED_MARKER;
+			finalSegments = [finalText];
+		} else {
+			finalText = turnText || "No response from Claude.";
+			finalSegments = textSegments;
+		}
+
+		await sendFinalResponse(
+			client,
+			ctx,
+			messageId,
+			finalText,
+			finalSegments,
+			lastEditText,
+			log,
+		);
+
+		// Reset per-turn state so the next continuation gets its own bubble.
+		messageId = null;
+		turnText = "";
+		textSegments = [];
+		currentSegment = "";
+		lastEditText = "";
+		lastEditTime = 0;
+		currentTool = "";
+		turnTools = [];
+		afterToolResult = false;
+	};
+
 	try {
 		try {
 			for await (const event of events) {
+				onEvent?.(event);
 				let shouldUpdate = false;
+				lastEventAt = Date.now();
 
 				switch (event.type) {
 					case "text_delta":
@@ -83,7 +160,7 @@ export async function streamToTelegram(
 							firstTokenMarked = true;
 							timer?.mark("first_token");
 						}
-						if (afterToolResult && accumulatedText.length > 0) {
+						if (afterToolResult && turnText.length > 0) {
 							// Close current segment — visual separation is handled
 							// by expandable blockquotes in the final HTML render.
 							textSegments.push(currentSegment);
@@ -91,7 +168,8 @@ export async function streamToTelegram(
 							afterToolResult = false;
 						}
 						currentSegment += event.content;
-						accumulatedText += event.content;
+						turnText += event.content;
+						aggregateText += event.content;
 						shouldUpdate = true;
 						break;
 					case "tool_use": {
@@ -100,7 +178,8 @@ export async function streamToTelegram(
 							? `${event.toolName}: ${detail}`
 							: event.toolName;
 						currentTool = label;
-						toolHistory.push(label);
+						turnTools.push(label);
+						aggregateTools.push(label);
 						shouldUpdate = true;
 						break;
 					}
@@ -110,6 +189,12 @@ export async function streamToTelegram(
 						shouldUpdate = true;
 						break;
 					case "turn_complete":
+						// One agent-loop step finished. Finalize the bubble for
+						// it and reset; the CLI may auto-continue with another
+						// step driven by queued background-task notifications,
+						// or — for long-lived conversation forwarders — a new
+						// user input may arrive later. Either way the next
+						// events feed a fresh bubble.
 						completed = true;
 						if (event.sessionId) sessionId = event.sessionId;
 						if (event.costUsd != null) costUsd = event.costUsd;
@@ -117,6 +202,7 @@ export async function streamToTelegram(
 						if (event.outputTokens != null) outputTokens = event.outputTokens;
 						if (event.contextWindow != null)
 							contextWindow = event.contextWindow;
+						await finalizeTurn();
 						break;
 					case "error":
 						errorText = event.message;
@@ -133,9 +219,9 @@ export async function streamToTelegram(
 				const now = Date.now();
 				if (shouldUpdate && now - lastEditTime >= EDIT_INTERVAL_MS) {
 					const displayText = buildDisplayText(
-						accumulatedText,
+						turnText,
 						currentTool,
-						toolHistory,
+						turnTools,
 					);
 					if (displayText && displayText !== lastEditText) {
 						messageId = await sendOrEdit(
@@ -164,46 +250,37 @@ export async function streamToTelegram(
 
 		timer?.mark("stream_complete");
 
-		// Finalize the last segment
-		if (currentSegment) {
-			textSegments.push(currentSegment);
-		}
-
-		// Final response
-		let finalText: string;
-		if (errorText) {
-			finalText = accumulatedText
-				? `${truncate(accumulatedText)}\n\n[Error: ${errorText}]`
-				: `Error: ${errorText}`;
-		} else if (interrupted) {
-			finalText = accumulatedText
-				? `${truncate(accumulatedText)}\n\n${STREAM_INTERRUPTED_MARKER}`
-				: STREAM_INTERRUPTED_MARKER;
-		} else {
-			finalText = accumulatedText || "No response from Claude.";
-		}
-
-		const finalSegments = errorText || interrupted ? [finalText] : textSegments;
-
-		await sendFinalResponse(
-			client,
-			ctx,
-			messageId,
-			finalText,
-			finalSegments,
-			lastEditText,
-			log,
-		);
+		// Tail finalize — covers iterator-ended-mid-turn (e.g. codex one-shot
+		// exit, process death, error). For the normal Claude conversation
+		// path every turn is already flushed on `turn_complete`, so this is
+		// a no-op there.
+		await finalizeTurn();
 
 		timer?.mark("response_sent");
 	} finally {
 		clearInterval(typingInterval);
 	}
 
+	log.info(
+		{
+			chatId: ctx.chatId,
+			threadId: ctx.messageThreadId,
+			sessionId,
+			responseLen: aggregateText.length,
+			responsePreview: aggregateText.slice(0, 200),
+			toolCount: aggregateTools.length,
+			interrupted,
+			error: errorText,
+			inputTokens,
+			outputTokens,
+		},
+		"stream complete",
+	);
+
 	return {
 		sessionId,
-		responseText: accumulatedText,
-		toolHistory,
+		responseText: aggregateText,
+		toolHistory: aggregateTools,
 		error: errorText,
 		interrupted,
 		costUsd,
@@ -434,6 +511,7 @@ function buildFinalHtml(segments: string[]): string {
 export async function consumeEvents(
 	events: AsyncIterable<ClaudeStreamEvent>,
 	timer?: RequestTimer,
+	onEvent?: (event: ClaudeStreamEvent) => void,
 ): Promise<StreamResult> {
 	let accumulatedText = "";
 	const toolHistory: string[] = [];
@@ -450,6 +528,7 @@ export async function consumeEvents(
 
 	try {
 		for await (const event of events) {
+			onEvent?.(event);
 			switch (event.type) {
 				case "text_delta":
 					if (!firstTokenMarked) {

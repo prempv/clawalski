@@ -138,7 +138,9 @@ class EventQueue implements AsyncIterableIterator<BackendStreamEvent> {
 /**
  * One handle per conversation. Unlike `ClaudeProcess`, Codex's CLI is
  * one-shot — each turn spawns a fresh `codex exec [resume <id>]` and
- * exits. The handle just remembers the thread id between turns.
+ * exits. The handle just remembers the thread id between turns and
+ * exposes a long-lived event stream that subprocess events are pushed
+ * into across turns.
  */
 export class CodexProcess implements ConversationProcess {
 	private _sessionId: string | null;
@@ -148,6 +150,11 @@ export class CodexProcess implements ConversationProcess {
 	private currentRl: Interface | null = null;
 	/** True until the first turn has been sent — used to inject the system prompt once. */
 	private firstTurn: boolean;
+	private readonly events = new EventQueue();
+	// `active` flips on sendInput, off on subprocess close. Codex has no
+	// auto-continuation so subprocess close == quiescent.
+	private active = false;
+	private quiescentListeners = new Set<() => void>();
 
 	constructor(opts: BackendBridgeOptions, resumeSessionId?: string | null) {
 		this.opts = opts;
@@ -157,10 +164,38 @@ export class CodexProcess implements ConversationProcess {
 		this.firstTurn = !resumeSessionId;
 	}
 
-	sendMessage(
-		content: ContentBlock[],
-		timer?: RequestTimer,
-	): AsyncIterableIterator<BackendStreamEvent> {
+	stream(): AsyncIterable<BackendStreamEvent> {
+		return this.events;
+	}
+
+	get quiescent(): boolean {
+		return !this.active && this._alive;
+	}
+
+	onQuiescent(cb: () => void): () => void {
+		this.quiescentListeners.add(cb);
+		return () => {
+			this.quiescentListeners.delete(cb);
+		};
+	}
+
+	private markQuiescent(): void {
+		if (!this.active) return;
+		this.active = false;
+		const snapshot = [...this.quiescentListeners];
+		for (const cb of snapshot) {
+			try {
+				cb();
+			} catch {
+				// Listener errors must not break the bridge.
+			}
+		}
+	}
+
+	sendInput(content: ContentBlock[], timer?: RequestTimer): void {
+		if (!this._alive) return;
+		this.active = true;
+
 		const { promptText, imagePaths } = renderContent(content);
 
 		const promptToSend =
@@ -168,8 +203,6 @@ export class CodexProcess implements ConversationProcess {
 				? `${this.opts.systemPrompt}\n\n${promptText}`
 				: promptText;
 		this.firstTurn = false;
-
-		const queue = new EventQueue();
 
 		const codexArgs: string[] = [
 			"exec",
@@ -276,12 +309,12 @@ export class CodexProcess implements ConversationProcess {
 				case "item.started":
 				case "item.updated":
 				case "item.completed":
-					translateItem(parsed as CodexItemEvent, queue);
+					translateItem(parsed as CodexItemEvent, this.events);
 					break;
 				case "turn.completed": {
 					turnCompleted = true;
 					const usage = (parsed as CodexTurnCompleted).usage ?? {};
-					queue.push({
+					this.events.push({
 						type: "turn_complete",
 						sessionId: this._sessionId ?? undefined,
 						inputTokens: usage.input_tokens,
@@ -295,26 +328,28 @@ export class CodexProcess implements ConversationProcess {
 		proc.on("close", (code) => {
 			this.currentProc = null;
 			this.currentRl = null;
+			// Codex is per-turn: subprocess close means this turn is done. The
+			// long-lived event stream stays open so the next sendInput can spawn
+			// another subprocess. We DON'T call events.end() here — only close()
+			// does that.
 			if (!turnCompleted) {
 				if (code !== 0 && code !== null) {
-					queue.push({
+					this.events.push({
 						type: "error",
 						message: stderr.trim() || `codex CLI exited with code ${code}`,
 						sessionId: this._sessionId ?? undefined,
 					});
 				} else {
 					// Clean exit but no turn.completed — surface as interrupted.
-					queue.push({
+					this.events.push({
 						type: "error",
 						message: "codex CLI exited without completing the turn",
 						sessionId: this._sessionId ?? undefined,
 					});
 				}
 			}
-			queue.end();
+			this.markQuiescent();
 		});
-
-		return queue;
 	}
 
 	close(): void {
@@ -330,6 +365,8 @@ export class CodexProcess implements ConversationProcess {
 		if (this.currentRl) {
 			this.currentRl.close();
 		}
+		this.events.end();
+		this.quiescentListeners.clear();
 	}
 
 	get alive(): boolean {

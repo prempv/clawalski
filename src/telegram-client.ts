@@ -77,6 +77,23 @@ export class TelegramClient {
 		await this.call("deleteMessage", { ...params });
 	}
 
+	/**
+	 * Set or clear emoji reactions on a message. Used to acknowledge queued
+	 * messages without spamming the chat with text replies. Pass an empty
+	 * `emojis` array to clear reactions. Bot API 7.0+.
+	 */
+	async setMessageReaction(params: {
+		chat_id: number;
+		message_id: number;
+		emojis: string[];
+	}): Promise<void> {
+		await this.call("setMessageReaction", {
+			chat_id: params.chat_id,
+			message_id: params.message_id,
+			reaction: params.emojis.map((emoji) => ({ type: "emoji", emoji })),
+		});
+	}
+
 	async setWebhook(url: string, secret?: string): Promise<void> {
 		const params: Record<string, string> = { url };
 		if (secret) params.secret_token = secret;

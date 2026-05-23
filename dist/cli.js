@@ -105,6 +105,8 @@ function seedExamples(paths) {
 	if (existsSync(promptsSrc)) cpSync(promptsSrc, paths.promptsDir, { recursive: true });
 	const cronsExampleSrc = join(examples, "crons.example.json");
 	if (existsSync(cronsExampleSrc)) cpSync(cronsExampleSrc, join(paths.configDir, "crons.example.json"));
+	const bindingsExampleSrc = join(examples, "bindings.example.json");
+	if (existsSync(bindingsExampleSrc)) cpSync(bindingsExampleSrc, join(paths.configDir, "bindings.example.json"));
 }
 async function promptToken() {
 	const rl = readline.createInterface({
@@ -157,6 +159,7 @@ async function initCommand(argv) {
 	console.log("Next steps:");
 	console.log(`  - Edit ${paths.accessFile} (set allowedUsers / allowedGroups)`);
 	console.log(`  - Schedule jobs in ${paths.cronFile} (templates in ${paths.configDir}/crons.example.json)`);
+	console.log(`  - Bind topics to repos in ${paths.configDir}/bindings.json (template: ${paths.configDir}/bindings.example.json)`);
 	console.log(`  - Run: clawalski run ${paths.root}`);
 	console.log(`  - Or as a service: clawalski service install ${paths.root} --name <name>`);
 	return 0;
@@ -350,6 +353,63 @@ var PendingBackendStore = class {
 	}
 };
 //#endregion
+//#region src/binding-config.ts
+const bindingEntrySchema = z.object({
+	chatId: z.number().int(),
+	threadId: z.number().int().positive().optional(),
+	workingDir: z.string().min(1).optional(),
+	prompt: z.string().min(1).optional()
+}).refine((b) => b.workingDir != null || b.prompt != null, { message: "binding must set at least one of workingDir or prompt" });
+const bindingFileSchema = z.object({ bindings: z.array(bindingEntrySchema).default([]) });
+const EMPTY_CONFIG = { bindings: [] };
+function validateWorkingDir(dir, log) {
+	try {
+		if (!statSync(dir).isDirectory()) {
+			log?.warn({ workingDir: dir }, "binding workingDir is not a directory");
+			return false;
+		}
+		return true;
+	} catch {
+		log?.warn({ workingDir: dir }, "binding workingDir does not exist");
+		return false;
+	}
+}
+function parseBindingConfig(raw, log) {
+	return { bindings: bindingFileSchema.parse(raw).bindings.filter((b) => {
+		if (b.workingDir != null && !validateWorkingDir(b.workingDir, log)) return false;
+		return true;
+	}) };
+}
+function loadBindingConfig(filePath, log) {
+	try {
+		const content = readFileSync(filePath, "utf-8");
+		const config = parseBindingConfig(JSON.parse(content), log);
+		log?.info({
+			count: config.bindings.length,
+			filePath
+		}, "binding config loaded");
+		return config;
+	} catch (err) {
+		if (err.code === "ENOENT") {
+			log?.info({ filePath }, "binding config not found, no bindings configured");
+			return EMPTY_CONFIG;
+		}
+		throw err;
+	}
+}
+function resolveBinding(ctx, config) {
+	const wantThreadId = ctx.isForum && ctx.threadId != null ? ctx.threadId : null;
+	for (const b of config.bindings) {
+		if (b.chatId !== ctx.chatId) continue;
+		if ((b.threadId ?? null) !== wantThreadId) continue;
+		return {
+			workingDir: b.workingDir ?? null,
+			prompt: b.prompt ?? null
+		};
+	}
+	return null;
+}
+//#endregion
 //#region src/backend.ts
 const BACKEND_IDS = ["claude", "codex"];
 function isBackendId(value) {
@@ -382,6 +442,7 @@ var EventQueue$1 = class {
 	waiting = null;
 	ended = false;
 	push(event) {
+		if (this.ended) return;
 		if (this.waiting) {
 			const resolve = this.waiting;
 			this.waiting = null;
@@ -392,6 +453,7 @@ var EventQueue$1 = class {
 		} else this.buffer.push(event);
 	}
 	end() {
+		if (this.ended) return;
 		this.ended = true;
 		if (this.waiting) {
 			const resolve = this.waiting;
@@ -424,12 +486,15 @@ var ClaudeProcess = class {
 	rl;
 	translator = new Translator();
 	streamParser = new StreamEventParser();
-	queue = null;
+	events = new EventQueue$1();
 	_sessionId = null;
 	_alive = true;
 	stderr = "";
 	turnTimer = null;
 	firstEventMarked = false;
+	openToolCalls = /* @__PURE__ */ new Set();
+	active = false;
+	quiescentListeners = /* @__PURE__ */ new Set();
 	constructor(opts, resumeSessionId) {
 		const args = [
 			"-p",
@@ -500,19 +565,16 @@ var ClaudeProcess = class {
 		this.rl.on("line", (line) => this.handleLine(line));
 		this.proc.on("close", (code) => {
 			this._alive = false;
-			if (this.queue) {
-				if (code !== 0 && code !== null) this.queue.push({
-					type: "error",
-					message: this.stderr.trim() || `Claude CLI exited with code ${code}`
-				});
-				this.queue.end();
-				this.queue = null;
-			}
+			if (code !== 0 && code !== null) this.events.push({
+				type: "error",
+				message: this.stderr.trim() || `Claude CLI exited with code ${code}`
+			});
+			this.events.end();
+			this.quiescentListeners.clear();
 		});
 	}
 	handleLine(line) {
 		if (!line.trim()) return;
-		if (!this.queue) return;
 		const parsed = parseLine(line);
 		if (!parsed) return;
 		if (!this.firstEventMarked) {
@@ -521,34 +583,52 @@ var ClaudeProcess = class {
 		}
 		if (parsed.type === "stream_event") {
 			const events = this.streamParser.process(parsed);
-			for (const ev of events) this.queue.push(ev);
+			for (const ev of events) this.publish(ev);
 			return;
 		}
 		if (parsed.type === "assistant") return;
 		const events = this.translator.translate(parsed);
 		for (const event of events) {
-			this.queue.push(event);
-			if (event.type === "turn_complete") {
-				if (event.sessionId) this._sessionId = event.sessionId;
-				this.queue.end();
-				this.queue = null;
-				return;
-			}
-			if (event.type === "error") {
-				if ("sessionId" in event && event.sessionId) this._sessionId = event.sessionId;
-				this.queue.end();
-				this.queue = null;
-				return;
-			}
+			if (event.type === "turn_complete" && event.sessionId) this._sessionId = event.sessionId;
+			if (event.type === "error" && "sessionId" in event && event.sessionId) this._sessionId = event.sessionId;
+			this.publish(event);
 		}
 	}
-	sendMessage(content, timer) {
+	/**
+	* Push an event into the long-lived stream and update the active/quiescent
+	* state machine. We track open tool calls so a multi-second tool run never
+	* looks "idle"; we only flip back to quiescent once turn_complete fires
+	* with no tool result still pending.
+	*/
+	publish(event) {
+		if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "tool_use" || event.type === "tool_result") this.active = true;
+		if (event.type === "tool_use") this.openToolCalls.add(event.toolUseId);
+		else if (event.type === "tool_result") this.openToolCalls.delete(event.toolUseId);
+		this.events.push(event);
+		if (event.type === "turn_complete") {
+			if (event.sessionId) this._sessionId = event.sessionId;
+			this.openToolCalls.clear();
+			this.markQuiescent();
+		}
+	}
+	markQuiescent() {
+		if (!this.active) return;
+		this.active = false;
+		const snapshot = [...this.quiescentListeners];
+		for (const cb of snapshot) try {
+			cb();
+		} catch {}
+	}
+	stream() {
+		return this.events;
+	}
+	sendInput(content, timer) {
+		if (!this._alive) return;
 		this.turnTimer = timer ?? null;
 		this.firstEventMarked = false;
 		this.translator = new Translator();
 		this.streamParser = new StreamEventParser();
-		const queue = new EventQueue$1();
-		this.queue = queue;
+		this.active = true;
 		timer?.mark("message_sent");
 		const msg = JSON.stringify({
 			type: "user",
@@ -560,7 +640,15 @@ var ClaudeProcess = class {
 			parent_tool_use_id: null
 		});
 		this.proc.stdin?.write(`${msg}\n`);
-		return queue;
+	}
+	get quiescent() {
+		return !this.active && this._alive;
+	}
+	onQuiescent(cb) {
+		this.quiescentListeners.add(cb);
+		return () => {
+			this.quiescentListeners.delete(cb);
+		};
 	}
 	close() {
 		if (this._alive) this.proc.stdin?.end();
@@ -607,16 +695,20 @@ const AUTH_ERROR_PATTERN = /API Error: 401|authentication_error|Invalid authenti
 function isAuthError(message) {
 	return AUTH_ERROR_PATTERN.test(message);
 }
-async function* sendMessageWithAuthRetry(spawnProcess, removeProcess, content, timer, log, options = {}) {
+async function* sendMessageWithAuthRetry(initialProc, respawnProcess, removeProcess, content, timer, log, options = {}) {
 	const maxAttempts = options.maxAttempts ?? 3;
 	const retryDelaysMs = options.retryDelaysMs ?? [2e3, 5e3];
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-		if (attempt > 1) {
+		let proc;
+		if (attempt === 1) proc = initialProc;
+		else {
 			removeProcess();
 			const delay = retryDelaysMs[Math.min(attempt - 2, retryDelaysMs.length - 1)] ?? 0;
 			if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+			proc = respawnProcess();
 		}
-		const iter = spawnProcess().sendMessage(content, timer)[Symbol.asyncIterator]();
+		proc.sendInput(content, timer);
+		const iter = proc.stream()[Symbol.asyncIterator]();
 		const buffered = [];
 		let retry = false;
 		let committed = false;
@@ -653,6 +745,12 @@ async function* sendMessageWithAuthRetry(spawnProcess, removeProcess, content, t
 		return;
 	}
 }
+const FINAL_STOP_REASONS = new Set([
+	"end_turn",
+	"stop_sequence",
+	"max_tokens",
+	"refusal"
+]);
 /**
 * Stateful parser for `stream_event` envelopes from Claude Code.
 *
@@ -671,10 +769,26 @@ var StreamEventParser = class {
 	pendingToolUseId = "";
 	pendingToolName = "";
 	pendingToolInput = "";
+	pendingStopReason = null;
 	process(raw) {
 		const event = raw.event;
 		if (!event) return [];
 		switch (event.type) {
+			case "message_start":
+				this.pendingStopReason = null;
+				return [];
+			case "message_delta":
+				if (event.delta?.stop_reason != null) this.pendingStopReason = event.delta.stop_reason;
+				return [];
+			case "message_stop": {
+				const stopReason = this.pendingStopReason;
+				this.pendingStopReason = null;
+				if (stopReason && FINAL_STOP_REASONS.has(stopReason)) return [raw.session_id ? {
+					type: "turn_complete",
+					sessionId: raw.session_id
+				} : { type: "turn_complete" }];
+				return [];
+			}
 			case "content_block_start": {
 				const block = event.content_block;
 				if (block?.type === "tool_use") {
@@ -768,7 +882,9 @@ var EventQueue = class {
 /**
 * One handle per conversation. Unlike `ClaudeProcess`, Codex's CLI is
 * one-shot — each turn spawns a fresh `codex exec [resume <id>]` and
-* exits. The handle just remembers the thread id between turns.
+* exits. The handle just remembers the thread id between turns and
+* exposes a long-lived event stream that subprocess events are pushed
+* into across turns.
 */
 var CodexProcess = class {
 	_sessionId;
@@ -778,16 +894,40 @@ var CodexProcess = class {
 	currentRl = null;
 	/** True until the first turn has been sent — used to inject the system prompt once. */
 	firstTurn;
+	events = new EventQueue();
+	active = false;
+	quiescentListeners = /* @__PURE__ */ new Set();
 	constructor(opts, resumeSessionId) {
 		this.opts = opts;
 		this._sessionId = resumeSessionId ?? null;
 		this.firstTurn = !resumeSessionId;
 	}
-	sendMessage(content, timer) {
+	stream() {
+		return this.events;
+	}
+	get quiescent() {
+		return !this.active && this._alive;
+	}
+	onQuiescent(cb) {
+		this.quiescentListeners.add(cb);
+		return () => {
+			this.quiescentListeners.delete(cb);
+		};
+	}
+	markQuiescent() {
+		if (!this.active) return;
+		this.active = false;
+		const snapshot = [...this.quiescentListeners];
+		for (const cb of snapshot) try {
+			cb();
+		} catch {}
+	}
+	sendInput(content, timer) {
+		if (!this._alive) return;
+		this.active = true;
 		const { promptText, imagePaths } = renderContent(content);
 		const promptToSend = this.firstTurn && this.opts.systemPrompt ? `${this.opts.systemPrompt}\n\n${promptText}` : promptText;
 		this.firstTurn = false;
-		const queue = new EventQueue();
 		const codexArgs = [
 			"exec",
 			"--dangerously-bypass-approvals-and-sandbox",
@@ -868,12 +1008,12 @@ var CodexProcess = class {
 				case "item.started":
 				case "item.updated":
 				case "item.completed":
-					translateItem(parsed, queue);
+					translateItem(parsed, this.events);
 					break;
 				case "turn.completed": {
 					turnCompleted = true;
 					const usage = parsed.usage ?? {};
-					queue.push({
+					this.events.push({
 						type: "turn_complete",
 						sessionId: this._sessionId ?? void 0,
 						inputTokens: usage.input_tokens,
@@ -886,19 +1026,18 @@ var CodexProcess = class {
 		proc.on("close", (code) => {
 			this.currentProc = null;
 			this.currentRl = null;
-			if (!turnCompleted) if (code !== 0 && code !== null) queue.push({
+			if (!turnCompleted) if (code !== 0 && code !== null) this.events.push({
 				type: "error",
 				message: stderr.trim() || `codex CLI exited with code ${code}`,
 				sessionId: this._sessionId ?? void 0
 			});
-			else queue.push({
+			else this.events.push({
 				type: "error",
 				message: "codex CLI exited without completing the turn",
 				sessionId: this._sessionId ?? void 0
 			});
-			queue.end();
+			this.markQuiescent();
 		});
-		return queue;
 	}
 	close() {
 		if (!this._alive) return;
@@ -907,6 +1046,8 @@ var CodexProcess = class {
 			this.currentProc.kill("SIGTERM");
 		} catch {}
 		if (this.currentRl) this.currentRl.close();
+		this.events.end();
+		this.quiescentListeners.clear();
 	}
 	get alive() {
 		return this._alive;
@@ -1063,6 +1204,7 @@ const configSchema = z.object({
 	instancePath: z.string().min(1),
 	accessFile: z.string().min(1),
 	cronFile: z.string().min(1),
+	bindingsFile: z.string().min(1),
 	sessionDbPath: z.string().min(1),
 	logDir: z.string().min(1),
 	conversationLogDir: z.string().min(1),
@@ -1096,6 +1238,7 @@ function loadConfig({ instancePath }) {
 		instancePath,
 		accessFile: process.env.ACCESS_FILE || join(instancePath, "config/access.json"),
 		cronFile: process.env.CRON_FILE || join(instancePath, "config/crons.json"),
+		bindingsFile: process.env.BINDINGS_FILE || join(instancePath, "config/bindings.json"),
 		sessionDbPath: process.env.SESSION_DB_PATH || join(instancePath, "data/sessions.db"),
 		logDir: process.env.LOG_DIR || join(instancePath, "data/logs"),
 		conversationLogDir: process.env.CONVERSATION_LOG_DIR || join(instancePath, "data/conversations"),
@@ -1629,26 +1772,38 @@ const EDIT_INTERVAL_MS = 1500;
 const TYPING_INTERVAL_MS = 4e3;
 const MAX_MESSAGE_LENGTH = 4096;
 const STREAM_INTERRUPTED_MARKER = "[Stream interrupted — the Claude CLI run ended before completion]";
-async function streamToTelegram(client, ctx, events, log, timer) {
+async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
+	log.info({
+		chatId: ctx.chatId,
+		threadId: ctx.messageThreadId,
+		replyToMessageId: ctx.replyToMessageId
+	}, "stream started");
+	const TYPING_STALE_MS = TYPING_INTERVAL_MS * 2;
+	let lastEventAt = 0;
 	const sendTyping = () => client.sendChatAction({
 		chat_id: ctx.chatId,
 		action: "typing",
 		...ctx.messageThreadId && { message_thread_id: ctx.messageThreadId }
 	}).catch(() => {});
 	await sendTyping();
-	const typingInterval = setInterval(sendTyping, TYPING_INTERVAL_MS);
+	lastEventAt = Date.now();
+	const typingInterval = setInterval(() => {
+		if (Date.now() - lastEventAt < TYPING_STALE_MS) sendTyping();
+	}, TYPING_INTERVAL_MS);
 	let messageId = null;
-	let accumulatedText = "";
-	const textSegments = [];
+	let turnText = "";
+	let textSegments = [];
 	let currentSegment = "";
 	let lastEditText = "";
 	let lastEditTime = 0;
 	let currentTool = "";
-	const toolHistory = [];
+	let turnTools = [];
+	let afterToolResult = false;
+	let aggregateText = "";
+	const aggregateTools = [];
 	let sessionId = null;
 	let errorText = null;
 	let firstTokenMarked = false;
-	let afterToolResult = false;
 	let costUsd = null;
 	let inputTokens = null;
 	let outputTokens = null;
@@ -1656,30 +1811,63 @@ async function streamToTelegram(client, ctx, events, log, timer) {
 	let model = null;
 	let completed = false;
 	let interrupted = false;
+	const finalizeTurn = async () => {
+		if (currentSegment) {
+			textSegments.push(currentSegment);
+			currentSegment = "";
+		}
+		if (textSegments.length === 0 && !errorText && !interrupted) return;
+		let finalText;
+		let finalSegments;
+		if (errorText) {
+			finalText = turnText ? `${truncate(turnText)}\n\n[Error: ${errorText}]` : `Error: ${errorText}`;
+			finalSegments = [finalText];
+		} else if (interrupted && textSegments.length === 0) {
+			finalText = STREAM_INTERRUPTED_MARKER;
+			finalSegments = [finalText];
+		} else {
+			finalText = turnText || "No response from Claude.";
+			finalSegments = textSegments;
+		}
+		await sendFinalResponse(client, ctx, messageId, finalText, finalSegments, lastEditText, log);
+		messageId = null;
+		turnText = "";
+		textSegments = [];
+		currentSegment = "";
+		lastEditText = "";
+		lastEditTime = 0;
+		currentTool = "";
+		turnTools = [];
+		afterToolResult = false;
+	};
 	try {
 		try {
 			for await (const event of events) {
+				onEvent?.(event);
 				let shouldUpdate = false;
+				lastEventAt = Date.now();
 				switch (event.type) {
 					case "text_delta":
 						if (!firstTokenMarked) {
 							firstTokenMarked = true;
 							timer?.mark("first_token");
 						}
-						if (afterToolResult && accumulatedText.length > 0) {
+						if (afterToolResult && turnText.length > 0) {
 							textSegments.push(currentSegment);
 							currentSegment = "";
 							afterToolResult = false;
 						}
 						currentSegment += event.content;
-						accumulatedText += event.content;
+						turnText += event.content;
+						aggregateText += event.content;
 						shouldUpdate = true;
 						break;
 					case "tool_use": {
 						const detail = summarizeToolInput(event.toolName, event.input);
 						const label = detail ? `${event.toolName}: ${detail}` : event.toolName;
 						currentTool = label;
-						toolHistory.push(label);
+						turnTools.push(label);
+						aggregateTools.push(label);
 						shouldUpdate = true;
 						break;
 					}
@@ -1695,6 +1883,7 @@ async function streamToTelegram(client, ctx, events, log, timer) {
 						if (event.inputTokens != null) inputTokens = event.inputTokens;
 						if (event.outputTokens != null) outputTokens = event.outputTokens;
 						if (event.contextWindow != null) contextWindow = event.contextWindow;
+						await finalizeTurn();
 						break;
 					case "error":
 						errorText = event.message;
@@ -1707,7 +1896,7 @@ async function streamToTelegram(client, ctx, events, log, timer) {
 				}
 				const now = Date.now();
 				if (shouldUpdate && now - lastEditTime >= EDIT_INTERVAL_MS) {
-					const displayText = buildDisplayText(accumulatedText, currentTool, toolHistory);
+					const displayText = buildDisplayText(turnText, currentTool, turnTools);
 					if (displayText && displayText !== lastEditText) {
 						messageId = await sendOrEdit(client, ctx, messageId, displayText, log);
 						lastEditText = displayText;
@@ -1721,20 +1910,27 @@ async function streamToTelegram(client, ctx, events, log, timer) {
 		}
 		if (!completed && !errorText && !interrupted) interrupted = true;
 		timer?.mark("stream_complete");
-		if (currentSegment) textSegments.push(currentSegment);
-		let finalText;
-		if (errorText) finalText = accumulatedText ? `${truncate(accumulatedText)}\n\n[Error: ${errorText}]` : `Error: ${errorText}`;
-		else if (interrupted) finalText = accumulatedText ? `${truncate(accumulatedText)}\n\n${STREAM_INTERRUPTED_MARKER}` : STREAM_INTERRUPTED_MARKER;
-		else finalText = accumulatedText || "No response from Claude.";
-		await sendFinalResponse(client, ctx, messageId, finalText, errorText || interrupted ? [finalText] : textSegments, lastEditText, log);
+		await finalizeTurn();
 		timer?.mark("response_sent");
 	} finally {
 		clearInterval(typingInterval);
 	}
+	log.info({
+		chatId: ctx.chatId,
+		threadId: ctx.messageThreadId,
+		sessionId,
+		responseLen: aggregateText.length,
+		responsePreview: aggregateText.slice(0, 200),
+		toolCount: aggregateTools.length,
+		interrupted,
+		error: errorText,
+		inputTokens,
+		outputTokens
+	}, "stream complete");
 	return {
 		sessionId,
-		responseText: accumulatedText,
-		toolHistory,
+		responseText: aggregateText,
+		toolHistory: aggregateTools,
 		error: errorText,
 		interrupted,
 		costUsd,
@@ -1855,7 +2051,7 @@ function buildFinalHtml(segments) {
 * Drain a Claude event stream without sending to Telegram.
 * Collects the full response for logging.
 */
-async function consumeEvents(events, timer) {
+async function consumeEvents(events, timer, onEvent) {
 	let accumulatedText = "";
 	const toolHistory = [];
 	let sessionId = null;
@@ -1869,35 +2065,38 @@ async function consumeEvents(events, timer) {
 	let completed = false;
 	let interrupted = false;
 	try {
-		for await (const event of events) switch (event.type) {
-			case "text_delta":
-				if (!firstTokenMarked) {
-					firstTokenMarked = true;
-					timer?.mark("first_token");
+		for await (const event of events) {
+			onEvent?.(event);
+			switch (event.type) {
+				case "text_delta":
+					if (!firstTokenMarked) {
+						firstTokenMarked = true;
+						timer?.mark("first_token");
+					}
+					accumulatedText += event.content;
+					break;
+				case "tool_use": {
+					const detail = summarizeToolInput(event.toolName, event.input);
+					const label = detail ? `${event.toolName}: ${detail}` : event.toolName;
+					toolHistory.push(label);
+					break;
 				}
-				accumulatedText += event.content;
-				break;
-			case "tool_use": {
-				const detail = summarizeToolInput(event.toolName, event.input);
-				const label = detail ? `${event.toolName}: ${detail}` : event.toolName;
-				toolHistory.push(label);
-				break;
+				case "turn_complete":
+					completed = true;
+					if (event.sessionId) sessionId = event.sessionId;
+					if (event.costUsd != null) costUsd = event.costUsd;
+					if (event.inputTokens != null) inputTokens = event.inputTokens;
+					if (event.outputTokens != null) outputTokens = event.outputTokens;
+					if (event.contextWindow != null) contextWindow = event.contextWindow;
+					break;
+				case "session_meta":
+					if (event.model) model = event.model;
+					break;
+				case "error":
+					errorText = event.message;
+					if (event.sessionId) sessionId = event.sessionId;
+					break;
 			}
-			case "turn_complete":
-				completed = true;
-				if (event.sessionId) sessionId = event.sessionId;
-				if (event.costUsd != null) costUsd = event.costUsd;
-				if (event.inputTokens != null) inputTokens = event.inputTokens;
-				if (event.outputTokens != null) outputTokens = event.outputTokens;
-				if (event.contextWindow != null) contextWindow = event.contextWindow;
-				break;
-			case "session_meta":
-				if (event.model) model = event.model;
-				break;
-			case "error":
-				errorText = event.message;
-				if (event.sessionId) sessionId = event.sessionId;
-				break;
 		}
 	} catch {
 		interrupted = true;
@@ -1935,6 +2134,25 @@ function splitText(text, maxLen) {
 }
 //#endregion
 //#region src/cron-handler.ts
+const CRON_IDLE_CLOSE_MS = 3e4;
+async function* withCronIdleClose(source, closeProc, idleMs) {
+	let timer = null;
+	const cancel = () => {
+		if (timer) {
+			clearTimeout(timer);
+			timer = null;
+		}
+	};
+	try {
+		for await (const ev of source) {
+			cancel();
+			yield ev;
+			if (ev.type === "turn_complete") timer = setTimeout(closeProc, idleMs);
+		}
+	} finally {
+		cancel();
+	}
+}
 const TRANSIENT_PATTERNS = [
 	"rate_limit",
 	"overloaded",
@@ -2009,22 +2227,34 @@ async function executeCronJob(job, deps, opts = {}) {
 		} catch (err) {
 			log.error({ err }, "CLI token warmup failed — proceeding anyway");
 		}
-		const events = sendMessageWithAuthRetry(() => cronPool.create(runKey, jobOptsArg, timer), () => cronPool.remove(runKey), [{
+		const content = [{
 			type: "text",
 			text: prompt
-		}], timer, log);
+		}];
+		const cronConvId = `cron:${job.id}`;
+		deps.sessionRecorder.start({
+			conversationId: cronConvId,
+			backend: backendId
+		});
+		deps.sessionRecorder.recordUserInput(cronConvId, prompt);
+		const recordEvent = (ev) => deps.sessionRecorder.recordEvent(cronConvId, ev);
+		let currentProc = cronPool.create(runKey, jobOptsArg, timer);
+		const wrapped = withCronIdleClose(sendMessageWithAuthRetry(currentProc, () => {
+			currentProc = cronPool.create(runKey, jobOptsArg, timer);
+			return currentProc;
+		}, () => cronPool.remove(runKey), content, timer, log), () => currentProc.close(), CRON_IDLE_CLOSE_MS);
 		const chatId = opts.overrideChatId ?? job.chatId;
 		const threadId = opts.overrideThreadId ?? job.threadId;
 		let result;
 		if (chatId) result = await streamToTelegram(client, {
 			chatId,
 			messageThreadId: threadId
-		}, events, log, timer);
-		else result = await consumeEvents(events, timer);
+		}, wrapped, log, timer, recordEvent);
+		else result = await consumeEvents(wrapped, timer, recordEvent);
+		deps.sessionRecorder.end(cronConvId);
 		timer.mark("done");
 		const timings = timer.summary();
 		const failureReason = result.error ?? (result.interrupted ? "stream interrupted" : null);
-		const cronConvId = `cron:${job.id}`;
 		conversationLogger.log({
 			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
 			conversationId: cronConvId,
@@ -2040,15 +2270,6 @@ async function executeCronJob(job, deps, opts = {}) {
 			durationMs: timings.total ?? 0,
 			timings,
 			error: failureReason
-		});
-		deps.sessionStore.updateStats(cronConvId, {
-			backend: backendId,
-			claudeSessionId: result.sessionId,
-			model: result.model,
-			inputTokens: result.inputTokens,
-			outputTokens: result.outputTokens,
-			costUsd: result.costUsd,
-			contextWindow: result.contextWindow
 		});
 		if (failureReason) {
 			recordFailure(job, deps, failureReason, isTransientError(failureReason));
@@ -2548,19 +2769,132 @@ function extractMessageContext(message) {
 	};
 }
 //#endregion
+//#region src/stats-format.ts
+const fmt = (n) => n.toLocaleString("en-US");
+const TERMINATION_LABELS = {
+	awaiting_user: "awaiting user",
+	tool_call_pending: "tool call in progress",
+	clean: "ended cleanly",
+	truncated: "truncated",
+	unknown: "unknown"
+};
+const OUTCOME_LABELS = {
+	completed: "completed",
+	abandoned: "abandoned",
+	errored: "errored",
+	unknown: "unknown"
+};
+function formatStatsMessage(signals) {
+	const lines = ["Session Stats", ""];
+	lines.push(`Session: ${signals.sessionId ?? "unknown"}`);
+	if (signals.model) lines.push(`Model: ${signals.model}`);
+	if (signals.hasPeakContextTokens && signals.contextWindow) {
+		const pct = (signals.peakContextTokens / signals.contextWindow * 100).toFixed(1);
+		lines.push(`Context peak: ${fmt(signals.peakContextTokens)} / ${fmt(signals.contextWindow)} (${pct}%)`);
+	} else if (signals.hasPeakContextTokens) lines.push(`Context peak: ${fmt(signals.peakContextTokens)}`);
+	lines.push("");
+	if (signals.hasTotalOutputTokens) lines.push(`Output tokens: ${fmt(signals.totalOutputTokens)}`);
+	if (signals.totalCostUsd != null) lines.push(`Session cost: $${signals.totalCostUsd.toFixed(4)}`);
+	lines.push(`Turns: ${signals.turns}`);
+	lines.push(`Messages: ${signals.messageCount}`);
+	if (signals.toolCallCount > 0) lines.push(`Tool calls: ${signals.toolCallCount}`);
+	const healthLine = formatHealthLine(signals);
+	if (healthLine) {
+		lines.push("");
+		lines.push(healthLine);
+	}
+	const flags = formatFlagsLine(signals);
+	if (flags.length > 0) lines.push(...flags);
+	const status = formatStatusLine(signals);
+	if (status) {
+		lines.push("");
+		lines.push(status);
+	}
+	const ago = Date.now() - signals.startedAt;
+	lines.push(`Active since: ${formatDuration(ago)} ago`);
+	return lines.join("\n");
+}
+function formatHealthLine(signals) {
+	if (signals.healthScore === null || signals.healthGrade === null) return null;
+	return `Health: ${signals.healthGrade} (${signals.healthScore}/100)`;
+}
+function formatFlagsLine(signals) {
+	const flags = [];
+	if (signals.toolFailureSignalCount > 0) flags.push(`Tool failures: ${signals.toolFailureSignalCount}`);
+	if (signals.toolRetryCount > 0) flags.push(`Tool retries: ${signals.toolRetryCount}`);
+	if (signals.editChurnCount > 0) flags.push(`Edit churn: ${signals.editChurnCount}`);
+	if (signals.compactionCount > 0) {
+		const mid = signals.midTaskCompactionCount > 0 ? ` (${signals.midTaskCompactionCount} mid-task)` : "";
+		flags.push(`Compactions: ${signals.compactionCount}${mid}`);
+	}
+	return flags;
+}
+function formatStatusLine(signals) {
+	const parts = [];
+	parts.push(`Status: ${TERMINATION_LABELS[signals.terminationStatus]}`);
+	if (signals.outcome !== "unknown" || signals.outcomeConfidence !== "low") parts.push(`outcome: ${OUTCOME_LABELS[signals.outcome]} (${signals.outcomeConfidence})`);
+	return parts.join(" · ");
+}
+function formatDuration(ms) {
+	const totalSec = Math.max(0, Math.floor(ms / 1e3));
+	if (totalSec < 60) return `${totalSec}s`;
+	const totalMin = Math.floor(totalSec / 60);
+	if (totalMin < 60) return `${totalMin}m`;
+	return `${Math.floor(totalMin / 60)}h ${totalMin % 60}m`;
+}
+//#endregion
 //#region src/claude-handler.ts
 function pickBackend(ctx, opts, existing) {
-	if (existing) return existing.backend;
 	const pending = opts.pendingBackends.get(ctx.conversationId);
 	if (pending) return pending;
+	if (existing) return existing.backend;
 	const access = opts.getAccess();
 	const channelDefault = ctx.chatType === "private" ? access.dmDefaultBackend : access.groupDefaultBackend;
 	if (channelDefault) return channelDefault;
 	return opts.backends.defaultId;
 }
-const activeRequests = /* @__PURE__ */ new Set();
+const sessions = /* @__PURE__ */ new Map();
+const MAX_QUEUE_SIZE = 10;
+const QUEUE_ACK_EMOJI = "👀";
 const MEDIA_GROUP_DELAY_MS = 500;
 const mediaGroupBuffers = /* @__PURE__ */ new Map();
+function enqueueMessage(session, item) {
+	if (session.pending.length >= MAX_QUEUE_SIZE) return false;
+	session.pending.push(item);
+	return true;
+}
+function pendingItemLogFields(item) {
+	const firstMsg = item.kind === "single" ? item.message : item.messages[0];
+	const text = extractText(firstMsg);
+	return {
+		kind: item.kind,
+		messageId: firstMsg.message_id,
+		textLen: text?.length ?? 0,
+		textPreview: text?.slice(0, 200) ?? "[media]",
+		...item.kind === "group" && { groupSize: item.messages.length }
+	};
+}
+/**
+* Acknowledge a queued message with an emoji reaction. Falls back to a tiny
+* text reply if reactions aren't available (older bot or restricted chat).
+*/
+async function ackQueued(client, message, queueDepth, log) {
+	try {
+		await client.setMessageReaction({
+			chat_id: message.chat.id,
+			message_id: message.message_id,
+			emojis: [QUEUE_ACK_EMOJI]
+		});
+	} catch (err) {
+		log.debug({ err }, "reaction ack failed, sending text ack");
+		await client.sendMessage({
+			chat_id: message.chat.id,
+			text: `Queued (${queueDepth} ahead). Will run after the current turn.`,
+			...message.message_thread_id && { message_thread_id: message.message_thread_id },
+			reply_parameters: { message_id: message.message_id }
+		}).catch(() => {});
+	}
+}
 async function handleUpdate(client, update, log, opts, timer) {
 	const message = update.message ?? update.edited_message;
 	if (!message) return;
@@ -2595,8 +2929,6 @@ async function handleUpdate(client, update, log, opts, timer) {
 	await processSingleMessage(client, message, log, opts, timer);
 }
 async function processSingleMessage(client, message, log, opts, timer) {
-	const t = timer ?? new RequestTimer();
-	t.mark("handler_start");
 	const ctx = extractMessageContext(message);
 	const access = opts.getAccess();
 	if (!isAllowed(ctx, access)) {
@@ -2620,8 +2952,9 @@ async function processSingleMessage(client, message, log, opts, timer) {
 	const hasPhoto = !!message.photo?.length;
 	const hasDocument = !!message.document;
 	if (!text && !hasPhoto && !hasDocument) return;
-	if (text?.startsWith("/new")) {
-		await handleNewCommand(client, ctx.conversationId, message, opts, log);
+	const newBackend = matchNewBackendCommand(text);
+	if (newBackend) {
+		await handleNewBackendCommand(client, ctx.conversationId, message, newBackend, opts, log);
 		return;
 	}
 	if (text?.startsWith("/stats")) {
@@ -2632,204 +2965,385 @@ async function processSingleMessage(client, message, log, opts, timer) {
 		await handleRunCronCommand(client, message, commandToJobName(text.split(/\s/)[0]?.slice(1) ?? ""), opts.cronScheduler, log);
 		return;
 	}
-	const effectiveText = text != null && /^\/cron(\s|@|$)/.test(text) ? buildCronSkillMessage(text.replace(/^\/cron(@\S+)?\s*/, ""), ctx, opts.promptsDir, opts.cronFilePath) : text;
-	const cleanText = effectiveText ? stripBotMention(effectiveText, opts.botUsername) : null;
-	if (activeRequests.has(ctx.conversationId)) {
-		await client.sendMessage({
-			chat_id: ctx.chatId,
-			text: "Still processing your previous message. Please wait.",
-			...message.message_thread_id && { message_thread_id: message.message_thread_id },
-			reply_parameters: { message_id: message.message_id }
-		});
+	const existing = sessions.get(ctx.conversationId);
+	if (existing?.proc.alive) {
+		await submitToExistingSession(client, existing, {
+			kind: "single",
+			message
+		}, log, opts);
 		return;
 	}
-	activeRequests.add(ctx.conversationId);
+	await startSession(client, message, log, opts, timer);
+}
+/**
+* Submit a message to an already-running session. If Claude is busy
+* (mid-turn), enqueue and ack with 👀; the session's onQuiescent listener
+* will drain when the turn really ends. If quiescent, dispatch immediately.
+*/
+async function submitToExistingSession(client, session, item, log, opts) {
+	if (!session.proc.quiescent || session.submitInFlight) {
+		const ok = enqueueMessage(session, item);
+		const firstMsg = item.kind === "single" ? item.message : item.messages[0];
+		if (!ok) {
+			await client.sendMessage({
+				chat_id: firstMsg.chat.id,
+				text: `Queue is full (${MAX_QUEUE_SIZE} messages). Wait for the current turn to finish.`,
+				...firstMsg.message_thread_id && { message_thread_id: firstMsg.message_thread_id },
+				reply_parameters: { message_id: firstMsg.message_id }
+			}).catch(() => {});
+			return;
+		}
+		log.info({
+			conversationId: session.conversationId,
+			backend: session.backendId,
+			sessionId: session.proc.sessionId,
+			queueDepth: session.pending.length,
+			quiescent: session.proc.quiescent,
+			submitInFlight: session.submitInFlight,
+			...pendingItemLogFields(item)
+		}, "message queued behind active session");
+		await ackQueued(client, firstMsg, session.pending.length, log);
+		return;
+	}
+	await dispatchPendingItem(client, session, item, log, opts);
+}
+/**
+* Build content blocks for a queued item and call proc.sendInput. Marks
+* `submitInFlight` so onQuiescent doesn't fire two drains concurrently
+* while we're awaiting photo/doc downloads.
+*/
+async function dispatchPendingItem(client, session, item, log, opts) {
+	session.submitInFlight = true;
 	try {
-		const content = [];
-		if (hasPhoto) try {
-			const imageBlock = await downloadPhoto(client, message.photo ?? []);
-			content.push(imageBlock);
-		} catch (err) {
-			log.error({ err }, "failed to download photo");
-			content.push({
-				type: "text",
-				text: "[photo — download failed]"
-			});
+		if (item.kind === "single") {
+			const content = await buildSingleContent(client, item.message, log, opts);
+			if (content && content.length > 0) {
+				const text = describeContentBlocks(content);
+				opts.sessionRecorder.recordUserInput(session.conversationId, text);
+				log.info({
+					conversationId: session.conversationId,
+					backend: session.backendId,
+					sessionId: session.proc.sessionId,
+					blocks: content.length,
+					textLen: text.length,
+					textPreview: text.slice(0, 200),
+					kind: "single"
+				}, "dispatching to backend CLI");
+				session.proc.sendInput(content);
+			}
+		} else {
+			const content = await buildGroupContent(client, item.messages, log, opts);
+			if (content && content.length > 0) {
+				const text = describeContentBlocks(content);
+				opts.sessionRecorder.recordUserInput(session.conversationId, text);
+				log.info({
+					conversationId: session.conversationId,
+					backend: session.backendId,
+					sessionId: session.proc.sessionId,
+					blocks: content.length,
+					textLen: text.length,
+					textPreview: text.slice(0, 200),
+					kind: "group"
+				}, "dispatching to backend CLI");
+				session.proc.sendInput(content);
+			}
 		}
-		if (hasDocument && message.document) try {
-			const ref = `[File saved to: ${await downloadDocument(client, message.document)}]\nRead and process this file.`;
-			content.push({
-				type: "text",
-				text: ref
-			});
-		} catch (err) {
-			log.error({ err }, "failed to download document");
-			content.push({
-				type: "text",
-				text: `[document: ${message.document.file_name ?? "unknown"} — download failed]`
-			});
-		}
-		if (cleanText) content.push({
-			type: "text",
-			text: cleanText
-		});
-		if (content.length === 0) return;
-		const inputDescription = describeInput(hasPhoto, hasDocument, cleanText);
-		t.mark("session_lookup");
-		const existingSession = opts.sessionStore.getSession(ctx.conversationId);
-		const backendId = pickBackend(ctx, opts, existingSession);
-		const pool = opts.backends.pool(backendId);
-		log.info({
-			conversationId: ctx.conversationId,
-			backend: backendId,
-			hasSession: !!existingSession,
-			sender: ctx.senderName,
-			hasPhoto,
-			hasDocument
-		}, "routing message");
-		t.mark("claude_invoke");
-		if (backendId === "claude") try {
-			await ensureFreshCliToken(log);
-		} catch (err) {
-			log.error({ err }, "CLI token warmup failed — proceeding anyway");
-		}
-		const overrides = buildProcessOverrides(opts, ctx);
-		let lastProc = null;
-		const events = sendMessageWithAuthRetry(() => {
-			lastProc = pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides);
-			return lastProc;
-		}, () => pool.remove(ctx.conversationId), content, t, log);
-		const result = await streamToTelegram(client, {
-			chatId: ctx.chatId,
-			messageThreadId: message.message_thread_id,
-			replyToMessageId: message.message_id
-		}, events, log, t);
-		t.mark("done");
-		const sessionId = result.sessionId ?? lastProc?.sessionId;
-		if (sessionId) {
-			opts.sessionStore.setSession(ctx.conversationId, sessionId, backendId);
-			opts.pendingBackends.clear(ctx.conversationId);
-			opts.sessionStore.updateStats(ctx.conversationId, {
-				backend: backendId,
-				claudeSessionId: sessionId,
-				model: result.model,
-				inputTokens: result.inputTokens,
-				outputTokens: result.outputTokens,
-				costUsd: result.costUsd,
-				contextWindow: result.contextWindow
-			});
-			opts.conversationLogger.log({
-				timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-				conversationId: ctx.conversationId,
-				sessionId,
-				sender: {
-					id: ctx.senderId,
-					name: ctx.senderName,
-					username: ctx.senderUsername
-				},
-				input: inputDescription,
-				output: result.responseText,
-				tools: result.toolHistory,
-				durationMs: t.summary().total ?? 0,
-				error: result.error ?? (result.interrupted ? "stream interrupted" : null),
-				timings: t.summary()
-			});
-		}
-		log.info({
-			conversationId: ctx.conversationId,
-			timings: t.summary(),
-			tools: result.toolHistory.length,
-			sender: ctx.senderName
-		}, "claude response complete");
+	} finally {
+		session.submitInFlight = false;
+	}
+}
+function describeContentBlocks(blocks) {
+	const parts = [];
+	for (const block of blocks) if (block.type === "text") parts.push(block.text);
+	else if (block.type === "image") parts.push("[image]");
+	return parts.join("\n").trim() || "[media]";
+}
+/**
+* Spawn a new ClaudeProcess for this conversation, attach a long-running
+* streamToTelegram forwarder, register the queue-drain listener, and submit
+* the first user message. Auth retry is handled by sendMessageWithAuthRetry
+* during the first message; subsequent messages reuse the committed proc
+* directly via proc.sendInput.
+*/
+async function startSession(client, message, log, opts, timer) {
+	const ctx = extractMessageContext(message);
+	const t = timer ?? new RequestTimer();
+	t.mark("handler_start");
+	const text = extractText(message);
+	const cleanText = text != null ? /^\/cron(\s|@|$)/.test(text) ? buildCronSkillMessage(text.replace(/^\/cron(@\S+)?\s*/, ""), ctx, opts.promptsDir, opts.cronFilePath) : stripBotMention(text, opts.botUsername) : null;
+	const content = await buildContent(client, message, cleanText, log);
+	if (content.length === 0) return;
+	const inputDescription = describeInput(!!message.photo?.length, !!message.document, cleanText);
+	t.mark("session_lookup");
+	const existingSession = opts.sessionStore.getSession(ctx.conversationId);
+	const backendId = pickBackend(ctx, opts, existingSession);
+	const pool = opts.backends.pool(backendId);
+	log.info({
+		conversationId: ctx.conversationId,
+		backend: backendId,
+		hasSession: !!existingSession,
+		sender: ctx.senderName,
+		hasPhoto: !!message.photo?.length,
+		hasDocument: !!message.document
+	}, "routing first message — starting session");
+	t.mark("claude_invoke");
+	if (backendId === "claude") try {
+		await ensureFreshCliToken(log);
 	} catch (err) {
+		log.error({ err }, "CLI token warmup failed — proceeding anyway");
+	}
+	const overrides = buildProcessOverrides(opts, ctx);
+	const proc = pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides);
+	opts.sessionRecorder.start({
+		conversationId: ctx.conversationId,
+		backend: backendId
+	});
+	const dispatchText = describeContentBlocks(content);
+	opts.sessionRecorder.recordUserInput(ctx.conversationId, dispatchText);
+	log.info({
+		conversationId: ctx.conversationId,
+		backend: backendId,
+		sessionId: existingSession?.sessionId ?? null,
+		blocks: content.length,
+		textLen: dispatchText.length,
+		textPreview: dispatchText.slice(0, 200),
+		kind: "single",
+		firstTurn: true
+	}, "dispatching to backend CLI");
+	const events = sendMessageWithAuthRetry(proc, () => pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides), () => pool.remove(ctx.conversationId), content, t, log);
+	const streamingContext = {
+		chatId: ctx.chatId,
+		messageThreadId: message.message_thread_id,
+		replyToMessageId: message.message_id
+	};
+	const session = {
+		conversationId: ctx.conversationId,
+		backendId,
+		proc,
+		forwarder: Promise.resolve(),
+		streamingContext,
+		pending: [],
+		submitInFlight: false,
+		unsubscribeQuiescent: () => {}
+	};
+	sessions.set(ctx.conversationId, session);
+	session.forwarder = streamToTelegram(client, streamingContext, events, log, t, (event) => opts.sessionRecorder.recordEvent(ctx.conversationId, event)).then((result) => {
+		t.mark("done");
+		if (sessions.get(ctx.conversationId) !== session) return result;
+		handleSessionResult(ctx, message, inputDescription, result, backendId, t, opts, log);
+		return result;
+	}).catch((err) => {
 		log.error({
 			err,
 			conversationId: ctx.conversationId
-		}, "claude handler error");
-		await client.sendMessage({
-			chat_id: ctx.chatId,
-			text: "Something went wrong. Please try again.",
-			...message.message_thread_id && { message_thread_id: message.message_thread_id },
-			reply_parameters: { message_id: message.message_id }
-		}).catch(() => {});
-	} finally {
-		activeRequests.delete(ctx.conversationId);
+		}, "long-running forwarder threw");
+		return null;
+	}).finally(() => {
+		const s = sessions.get(ctx.conversationId);
+		if (s === session) {
+			s.unsubscribeQuiescent();
+			sessions.delete(ctx.conversationId);
+		}
+		opts.sessionRecorder.end(ctx.conversationId);
+	});
+	session.unsubscribeQuiescent = proc.onQuiescent(() => {
+		drainPending(client, session, log, opts).catch((err) => log.error({
+			err,
+			conversationId: ctx.conversationId
+		}, "drain error"));
+	});
+}
+async function drainPending(client, session, log, opts) {
+	if (session.submitInFlight) {
+		log.debug({
+			conversationId: session.conversationId,
+			backend: session.backendId,
+			queueDepth: session.pending.length
+		}, "queue drain skipped during submit");
+		return;
 	}
+	if (!session.proc.quiescent) {
+		log.debug({
+			conversationId: session.conversationId,
+			backend: session.backendId,
+			queueDepth: session.pending.length,
+			sessionId: session.proc.sessionId
+		}, "queue drain skipped while session busy");
+		return;
+	}
+	const next = session.pending.shift();
+	if (!next) return;
+	log.info({
+		conversationId: session.conversationId,
+		backend: session.backendId,
+		sessionId: session.proc.sessionId,
+		queueDepthRemaining: session.pending.length,
+		...pendingItemLogFields(next)
+	}, "draining queued message");
+	await dispatchPendingItem(client, session, next, log, opts);
+}
+/**
+* Persist session metadata + log to disk after a turn finishes. Wired
+* onto the long-running forwarder's resolution; runs once when the
+* stream actually ends (i.e. process death). For routine multi-turn
+* conversations this is effectively a session-shutdown hook.
+*
+* Callers must verify the session they registered still owns the
+* conversation slot before invoking this — otherwise we'd risk writing
+* a stale or wrong-backend row to sessionStore.
+*/
+function handleSessionResult(ctx, firstMessage, inputDescription, result, backendId, t, opts, log) {
+	const sessionId = result.sessionId;
+	if (!sessionId) return;
+	opts.sessionStore.setSession(ctx.conversationId, sessionId, backendId);
+	opts.pendingBackends.clear(ctx.conversationId);
+	opts.conversationLogger.log({
+		timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+		conversationId: ctx.conversationId,
+		sessionId,
+		sender: {
+			id: ctx.senderId,
+			name: ctx.senderName,
+			username: ctx.senderUsername
+		},
+		input: inputDescription,
+		output: result.responseText,
+		tools: result.toolHistory,
+		durationMs: t.summary().total ?? 0,
+		error: result.error ?? (result.interrupted ? "stream interrupted" : null),
+		timings: t.summary()
+	});
+	log.info({
+		conversationId: ctx.conversationId,
+		timings: t.summary(),
+		tools: result.toolHistory.length,
+		triggeredBy: extractText(firstMessage)?.slice(0, 60) ?? "[media]"
+	}, "claude session ended");
+}
+async function buildContent(client, message, cleanText, log) {
+	const content = [];
+	const hasPhoto = !!message.photo?.length;
+	const hasDocument = !!message.document;
+	if (hasPhoto) try {
+		const imageBlock = await downloadPhoto(client, message.photo ?? []);
+		content.push(imageBlock);
+	} catch (err) {
+		log.error({ err }, "failed to download photo");
+		content.push({
+			type: "text",
+			text: "[photo — download failed]"
+		});
+	}
+	if (hasDocument && message.document) try {
+		const ref = `[File saved to: ${await downloadDocument(client, message.document)}]\nRead and process this file.`;
+		content.push({
+			type: "text",
+			text: ref
+		});
+	} catch (err) {
+		log.error({ err }, "failed to download document");
+		content.push({
+			type: "text",
+			text: `[document: ${message.document.file_name ?? "unknown"} — download failed]`
+		});
+	}
+	if (cleanText) content.push({
+		type: "text",
+		text: cleanText
+	});
+	return content;
+}
+async function buildSingleContent(client, message, log, opts) {
+	const text = extractText(message);
+	return buildContent(client, message, text != null ? /^\/cron(\s|@|$)/.test(text) ? buildCronSkillMessage(text.replace(/^\/cron(@\S+)?\s*/, ""), extractMessageContext(message), opts.promptsDir, opts.cronFilePath) : stripBotMention(text, opts.botUsername) : null, log);
+}
+async function buildGroupContent(client, messages, log, opts) {
+	const content = [];
+	let caption = null;
+	for (const msg of messages) {
+		if (msg.photo?.length) try {
+			const imageBlock = await downloadPhoto(client, msg.photo);
+			content.push(imageBlock);
+		} catch (err) {
+			log.error({ err }, "failed to download photo in media group");
+		}
+		if (msg.document) try {
+			const filePath = await downloadDocument(client, msg.document);
+			content.push({
+				type: "text",
+				text: `[File saved to: ${filePath}]\nRead and process this file.`
+			});
+		} catch (err) {
+			log.error({ err }, "failed to download document in media group");
+		}
+		if (!caption && msg.caption) caption = stripBotMention(msg.caption, opts.botUsername);
+	}
+	if (caption) content.push({
+		type: "text",
+		text: caption
+	});
+	return content;
 }
 async function handleStatsCommand(client, conversationId, message, opts) {
-	const stats = opts.sessionStore.getStats(conversationId);
 	const replyOpts = {
 		chat_id: message.chat.id,
 		...message.message_thread_id && { message_thread_id: message.message_thread_id },
 		reply_parameters: { message_id: message.message_id }
 	};
-	if (!stats) {
+	const signals = opts.sessionRecorder.compute(conversationId);
+	if (!signals) {
 		await client.sendMessage({
 			...replyOpts,
 			text: "No active session."
 		});
 		return;
 	}
-	const fmt = (n) => n.toLocaleString("en-US");
-	const totalTokens = stats.totalInputTokens + stats.totalOutputTokens;
-	const lines = ["Session Stats", ""];
-	lines.push(`Session: ${stats.claudeSessionId ?? "unknown"}`);
-	if (stats.model) lines.push(`Model: ${stats.model}`);
-	if (stats.contextWindow) {
-		const pct = (totalTokens / stats.contextWindow * 100).toFixed(1);
-		lines.push(`Context: ${fmt(totalTokens)} / ${fmt(stats.contextWindow)} (${pct}%)`);
-	}
-	lines.push("");
-	lines.push(`Input tokens: ${fmt(stats.totalInputTokens)}`);
-	lines.push(`Output tokens: ${fmt(stats.totalOutputTokens)}`);
-	if (stats.totalCostUsd != null) lines.push(`Session cost: $${stats.totalCostUsd.toFixed(4)}`);
-	lines.push(`Turns: ${stats.turns}`);
-	const ago = Math.floor(Date.now() / 1e3) - stats.createdAt;
-	if (ago < 3600) lines.push(`Active since: ${Math.floor(ago / 60)}m ago`);
-	else {
-		const hours = Math.floor(ago / 3600);
-		const mins = Math.floor(ago % 3600 / 60);
-		lines.push(`Active since: ${hours}h ${mins}m ago`);
-	}
 	await client.sendMessage({
 		...replyOpts,
-		text: lines.join("\n")
+		text: formatStatsMessage(signals)
 	});
 }
-async function handleNewCommand(client, conversationId, message, opts, log) {
+/**
+* Match `/new-claude`, `/new_claude`, `/new-codex`, or `/new_codex` (with
+* optional `@botname` suffix and trailing whitespace). Telegram's BotFather
+* menu only allows `[a-z0-9_]` so the registered commands use underscores;
+* we accept hyphens too because it's natural to type. No bare `/new` —
+* explicit commands only, since argument parsing was a regular source of
+* confusion ("did the bot read codex or did it default?").
+*/
+function matchNewBackendCommand(text) {
+	if (!text) return null;
+	const m = text.match(/^\/new[-_](claude|codex)(@\S+)?(\s|$)/i);
+	if (!m) return null;
+	const backend = m[1]?.toLowerCase();
+	return isBackendId(backend ?? "") ? backend : null;
+}
+async function handleNewBackendCommand(client, conversationId, message, backend, opts, log) {
 	const replyOpts = {
 		chat_id: message.chat.id,
 		...message.message_thread_id && { message_thread_id: message.message_thread_id },
 		reply_parameters: { message_id: message.message_id }
 	};
-	const arg = message.text?.replace(/^\/new(@\S+)?/, "").trim().toLowerCase() ?? "";
-	if (arg && !isBackendId(arg)) {
-		await client.sendMessage({
-			...replyOpts,
-			text: `Unknown backend: "${arg}". Use 'claude' or 'codex'.`
-		});
-		return;
-	}
 	for (const id of ["claude", "codex"]) opts.backends.pool(id).remove(conversationId);
 	opts.sessionStore.deleteSession(conversationId);
-	if (arg && isBackendId(arg)) {
-		opts.pendingBackends.set(conversationId, arg);
-		await client.sendMessage({
-			...replyOpts,
-			text: `Session cleared. Next message will use ${arg}.`
-		});
-		log.info({
-			conversationId,
-			backend: arg
-		}, "session cleared via /new <backend>");
-	} else {
-		opts.pendingBackends.clear(conversationId);
-		await client.sendMessage({
-			...replyOpts,
-			text: "Session cleared. Next message starts a fresh conversation."
-		});
-		log.info({ conversationId }, "session cleared via /new");
+	opts.sessionRecorder.delete(conversationId);
+	const session = sessions.get(conversationId);
+	const droppedQueueDepth = session?.pending.length ?? 0;
+	if (session) {
+		session.unsubscribeQuiescent();
+		sessions.delete(conversationId);
 	}
+	const droppedSuffix = droppedQueueDepth > 0 ? ` Dropped ${droppedQueueDepth} queued message${droppedQueueDepth === 1 ? "" : "s"}.` : "";
+	opts.pendingBackends.set(conversationId, backend);
+	await client.sendMessage({
+		...replyOpts,
+		text: `Session cleared. Next message will use ${backend}.${droppedSuffix}`
+	});
+	log.info({
+		conversationId,
+		backend,
+		droppedQueueDepth
+	}, "session cleared via /new-<backend>");
 }
 async function handleRunCronCommand(client, message, jobName, cronScheduler, log) {
 	const result = await cronScheduler.runJob(jobName, {
@@ -2861,137 +3375,119 @@ async function handleRunCronCommand(client, message, jobName, cronScheduler, log
 	}, "manual cron trigger");
 }
 /**
-* Process a batch of messages that share a media_group_id.
-* Downloads all photos/documents and sends them as a single Claude turn.
+* Process a batch of messages that share a media_group_id. Mirrors
+* processSingleMessage but with grouped content.
 */
 async function processMediaGroup(client, messages, log, opts) {
 	if (messages.length === 0) return;
-	const t = new RequestTimer();
-	t.mark("handler_start");
 	const first = messages[0];
 	const ctx = extractMessageContext(first);
 	if (!isAllowed(ctx, opts.getAccess())) return;
 	if (opts.respondMode === "mention" && ctx.chatType !== "private" && !messages.some((m) => isBotAddressed(m, opts.botUsername))) return;
-	if (activeRequests.has(ctx.conversationId)) {
-		await client.sendMessage({
-			chat_id: ctx.chatId,
-			text: "Still processing your previous message. Please wait.",
-			...first.message_thread_id && { message_thread_id: first.message_thread_id },
-			reply_parameters: { message_id: first.message_id }
-		});
+	const existing = sessions.get(ctx.conversationId);
+	if (existing?.proc.alive) {
+		await submitToExistingSession(client, existing, {
+			kind: "group",
+			messages
+		}, log, opts);
 		return;
 	}
-	activeRequests.add(ctx.conversationId);
-	try {
-		const content = [];
-		let caption = null;
-		for (const msg of messages) {
-			if (msg.photo?.length) try {
-				const imageBlock = await downloadPhoto(client, msg.photo);
-				content.push(imageBlock);
-			} catch (err) {
-				log.error({ err }, "failed to download photo in media group");
-			}
-			if (msg.document) try {
-				const filePath = await downloadDocument(client, msg.document);
-				content.push({
-					type: "text",
-					text: `[File saved to: ${filePath}]\nRead and process this file.`
-				});
-			} catch (err) {
-				log.error({ err }, "failed to download document in media group");
-			}
-			if (!caption && msg.caption) caption = stripBotMention(msg.caption, opts.botUsername);
-		}
-		if (caption) content.push({
-			type: "text",
-			text: caption
-		});
-		if (content.length === 0) return;
-		const photoCount = messages.filter((m) => m.photo?.length).length;
-		const docCount = messages.filter((m) => m.document).length;
-		const inputDescription = describeInput(photoCount > 0, docCount > 0, caption);
-		t.mark("session_lookup");
-		const existingSession = opts.sessionStore.getSession(ctx.conversationId);
-		const backendId = pickBackend(ctx, opts, existingSession);
-		const pool = opts.backends.pool(backendId);
-		log.info({
-			conversationId: ctx.conversationId,
-			backend: backendId,
-			hasSession: !!existingSession,
-			sender: ctx.senderName,
-			mediaGroupSize: messages.length,
-			photoCount,
-			docCount
-		}, "routing media group");
-		t.mark("claude_invoke");
-		if (backendId === "claude") try {
-			await ensureFreshCliToken(log);
-		} catch (err) {
-			log.error({ err }, "CLI token warmup failed — proceeding anyway");
-		}
-		const overrides = buildProcessOverrides(opts, ctx);
-		let lastProc = null;
-		const events = sendMessageWithAuthRetry(() => {
-			lastProc = pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides);
-			return lastProc;
-		}, () => pool.remove(ctx.conversationId), content, t, log);
-		const result = await streamToTelegram(client, {
-			chatId: ctx.chatId,
-			messageThreadId: first.message_thread_id,
-			replyToMessageId: first.message_id
-		}, events, log, t);
-		t.mark("done");
-		const sessionId = result.sessionId ?? lastProc?.sessionId;
-		if (sessionId) {
-			opts.sessionStore.setSession(ctx.conversationId, sessionId, backendId);
-			opts.pendingBackends.clear(ctx.conversationId);
-			opts.sessionStore.updateStats(ctx.conversationId, {
-				backend: backendId,
-				claudeSessionId: sessionId,
-				model: result.model,
-				inputTokens: result.inputTokens,
-				outputTokens: result.outputTokens,
-				costUsd: result.costUsd,
-				contextWindow: result.contextWindow
-			});
-			opts.conversationLogger.log({
-				timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-				conversationId: ctx.conversationId,
-				sessionId,
-				sender: {
-					id: ctx.senderId,
-					name: ctx.senderName,
-					username: ctx.senderUsername
-				},
-				input: inputDescription,
-				output: result.responseText,
-				tools: result.toolHistory,
-				durationMs: t.summary().total ?? 0,
-				error: result.error ?? (result.interrupted ? "stream interrupted" : null),
-				timings: t.summary()
-			});
-		}
-		log.info({
-			conversationId: ctx.conversationId,
-			timings: t.summary(),
-			tools: result.toolHistory.length,
-			sender: ctx.senderName
-		}, "claude media group response complete");
+	await startSessionFromGroup(client, messages, log, opts);
+}
+async function startSessionFromGroup(client, messages, log, opts) {
+	const t = new RequestTimer();
+	t.mark("handler_start");
+	const first = messages[0];
+	const ctx = extractMessageContext(first);
+	const content = await buildGroupContent(client, messages, log, opts);
+	if (content.length === 0) return;
+	const photoCount = messages.filter((m) => m.photo?.length).length;
+	const docCount = messages.filter((m) => m.document).length;
+	let caption = null;
+	for (const msg of messages) if (!caption && msg.caption) {
+		caption = stripBotMention(msg.caption, opts.botUsername);
+		break;
+	}
+	const inputDescription = describeInput(photoCount > 0, docCount > 0, caption);
+	t.mark("session_lookup");
+	const existingSession = opts.sessionStore.getSession(ctx.conversationId);
+	const backendId = pickBackend(ctx, opts, existingSession);
+	const pool = opts.backends.pool(backendId);
+	log.info({
+		conversationId: ctx.conversationId,
+		backend: backendId,
+		hasSession: !!existingSession,
+		sender: ctx.senderName,
+		mediaGroupSize: messages.length,
+		photoCount,
+		docCount
+	}, "routing media group — starting session");
+	t.mark("claude_invoke");
+	if (backendId === "claude") try {
+		await ensureFreshCliToken(log);
 	} catch (err) {
+		log.error({ err }, "CLI token warmup failed — proceeding anyway");
+	}
+	const overrides = buildProcessOverrides(opts, ctx);
+	const proc = pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides);
+	opts.sessionRecorder.start({
+		conversationId: ctx.conversationId,
+		backend: backendId
+	});
+	const dispatchText = describeContentBlocks(content);
+	opts.sessionRecorder.recordUserInput(ctx.conversationId, dispatchText);
+	log.info({
+		conversationId: ctx.conversationId,
+		backend: backendId,
+		sessionId: existingSession?.sessionId ?? null,
+		blocks: content.length,
+		textLen: dispatchText.length,
+		textPreview: dispatchText.slice(0, 200),
+		kind: "group",
+		firstTurn: true
+	}, "dispatching to backend CLI");
+	const events = sendMessageWithAuthRetry(proc, () => pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides), () => pool.remove(ctx.conversationId), content, t, log);
+	const streamingContext = {
+		chatId: ctx.chatId,
+		messageThreadId: first.message_thread_id,
+		replyToMessageId: first.message_id
+	};
+	const session = {
+		conversationId: ctx.conversationId,
+		backendId,
+		proc,
+		forwarder: Promise.resolve(),
+		streamingContext,
+		pending: [],
+		submitInFlight: false,
+		unsubscribeQuiescent: () => {}
+	};
+	sessions.set(ctx.conversationId, session);
+	session.forwarder = streamToTelegram(client, streamingContext, events, log, t, (event) => opts.sessionRecorder.recordEvent(ctx.conversationId, event)).then((result) => {
+		t.mark("done");
+		if (sessions.get(ctx.conversationId) !== session) return result;
+		handleSessionResult(ctx, first, inputDescription, result, backendId, t, opts, log);
+		return result;
+	}).catch((err) => {
 		log.error({
 			err,
 			conversationId: ctx.conversationId
-		}, "media group handler error");
-		await client.sendMessage({
-			chat_id: ctx.chatId,
-			text: "Something went wrong. Please try again.",
-			...first.message_thread_id && { message_thread_id: first.message_thread_id },
-			reply_parameters: { message_id: first.message_id }
-		}).catch(() => {});
-	} finally {
-		activeRequests.delete(ctx.conversationId);
-	}
+		}, "long-running forwarder threw (group)");
+		return null;
+	}).finally(() => {
+		const s = sessions.get(ctx.conversationId);
+		if (s === session) {
+			s.unsubscribeQuiescent();
+			sessions.delete(ctx.conversationId);
+		}
+		opts.sessionRecorder.end(ctx.conversationId);
+	});
+	session.unsubscribeQuiescent = proc.onQuiescent(() => {
+		drainPending(client, session, log, opts).catch((err) => log.error({
+			err,
+			conversationId: ctx.conversationId
+		}, "drain error (group)"));
+	});
 }
 function isBotAddressed(message, botUsername) {
 	const lower = botUsername.toLowerCase();
@@ -3053,14 +3549,18 @@ function describeInput(hasPhoto, hasDocument, text) {
 function buildProcessOverrides(opts, ctx) {
 	const tier = ctx.chatType === "private" ? "dm" : "group";
 	let systemPrompt = buildSystemPrompt(opts.promptsDir, tier);
+	const binding = resolveBinding(ctx, opts.bindings);
+	if (binding?.prompt) systemPrompt = systemPrompt !== void 0 ? `${systemPrompt}\n\n${binding.prompt}` : binding.prompt;
 	const convDirName = conversationIdToDir(ctx.conversationId);
 	const conversationHistoryDir = join(opts.conversationLogDir, convDirName);
 	const historyNote = `Past conversation history for this channel is stored in: ${conversationHistoryDir}/\nEach file is a JSONL log of a previous session containing input/output pairs. Read them if prior context would help answer the current question.`;
 	systemPrompt = systemPrompt !== void 0 ? `${systemPrompt}\n\n${historyNote}` : historyNote;
-	return {
+	const overrides = {
 		systemPrompt,
 		conversationHistoryDir
 	};
+	if (binding?.workingDir) overrides.workingDir = binding.workingDir;
+	return overrides;
 }
 function buildCronSkillMessage(userText, ctx, promptsDir, cronFilePath) {
 	const skillPath = join(promptsDir, "skills", "cron-manager.md");
@@ -3084,6 +3584,32 @@ function buildCronSkillMessage(userText, ctx, promptsDir, cronFilePath) {
 }
 //#endregion
 //#region src/poller.ts
+const TEXT_PREVIEW_MAX = 200;
+function summarizeUpdate(update) {
+	const kind = update.message ? "message" : update.edited_message ? "edited_message" : update.callback_query ? "callback_query" : "other";
+	const msg = update.message ?? update.edited_message;
+	if (!msg) return {
+		updateId: update.update_id,
+		kind
+	};
+	const text = msg.text ?? msg.caption ?? null;
+	return {
+		updateId: update.update_id,
+		kind,
+		chatId: msg.chat.id,
+		chatType: msg.chat.type,
+		threadId: msg.message_thread_id,
+		messageId: msg.message_id,
+		senderId: msg.from?.id,
+		senderUsername: msg.from?.username,
+		hasPhoto: !!msg.photo?.length,
+		hasDocument: !!msg.document,
+		hasMediaGroup: !!msg.media_group_id,
+		textLen: text?.length ?? 0,
+		textPreview: text ? text.slice(0, TEXT_PREVIEW_MAX) : null,
+		replyToMessageId: msg.reply_to_message?.message_id
+	};
+}
 async function startPolling(client, log, signal, opts) {
 	let offset;
 	const pollLog = log.child({ component: "poller" });
@@ -3092,6 +3618,7 @@ async function startPolling(client, log, signal, opts) {
 		const updates = await client.getUpdates(offset, 30);
 		for (const update of updates) {
 			offset = update.update_id + 1;
+			pollLog.info(summarizeUpdate(update), "telegram update received");
 			const timer = new RequestTimer();
 			timer.mark("message_received");
 			handleUpdate(client, update, log, opts, timer).catch((err) => {
@@ -3142,32 +3669,563 @@ function createApp(opts) {
 	return app;
 }
 //#endregion
+//#region src/session-stats/compaction.ts
+const COMPACTION_DROP_RATIO = .7;
+const BEFORE_WINDOW = 10;
+const AFTER_WINDOW = 5;
+function findCompactionBoundaries(messages) {
+	const explicit = [];
+	for (const m of messages) if (m.isCompactBoundary) explicit.push(m.ordinal);
+	if (explicit.length > 0) return explicit;
+	const heuristic = [];
+	let prev = null;
+	for (const m of messages) {
+		if (m.role !== "assistant" || m.contextTokens === null) continue;
+		if (prev !== null && m.contextTokens < prev * COMPACTION_DROP_RATIO) heuristic.push(m.ordinal);
+		prev = m.contextTokens;
+	}
+	return heuristic;
+}
+function countCompactions(messages) {
+	return findCompactionBoundaries(messages).length;
+}
+function countMidTaskCompactions(messages) {
+	const boundaries = findCompactionBoundaries(messages);
+	if (boundaries.length === 0) return 0;
+	const calls = [];
+	for (const m of messages) for (const c of m.toolCalls) calls.push({
+		name: c.toolName,
+		ordinal: m.ordinal
+	});
+	if (calls.length === 0) return 0;
+	let mid = 0;
+	for (const b of boundaries) {
+		const before = calls.filter((c) => c.ordinal < b).slice(-BEFORE_WINDOW);
+		const after = calls.filter((c) => c.ordinal > b).slice(0, AFTER_WINDOW);
+		const beforeNames = new Set(before.map((c) => c.name));
+		let overlap = 0;
+		const seen = /* @__PURE__ */ new Set();
+		for (const c of after) {
+			if (seen.has(c.name)) continue;
+			seen.add(c.name);
+			if (beforeNames.has(c.name)) overlap++;
+		}
+		if (overlap >= 2) mid++;
+	}
+	return mid;
+}
+//#endregion
+//#region src/session-stats/outcome.ts
+const RECENCY_WINDOW_MS = 600 * 1e3;
+const GIVE_UP_PATTERNS = [
+	/i'm unable to/i,
+	/i can't proceed/i,
+	/i don't have access/i,
+	/i cannot proceed/i,
+	/i am unable to/i
+];
+function classifyOutcome(input) {
+	if (input.isAutomated) return {
+		outcome: "unknown",
+		confidence: "low",
+		isRecent: false
+	};
+	if (input.messageCount === 2 && input.endedWithRole === "assistant") return {
+		outcome: "completed",
+		confidence: "medium",
+		isRecent: false
+	};
+	if (input.messageCount < 3) return {
+		outcome: "unknown",
+		confidence: "low",
+		isRecent: false
+	};
+	if (input.now - input.lastActivity < RECENCY_WINDOW_MS) return {
+		outcome: "unknown",
+		confidence: "low",
+		isRecent: true
+	};
+	if (input.endedWithRole === "user") return {
+		outcome: "abandoned",
+		confidence: input.messageCount >= 10 ? "high" : "medium",
+		isRecent: false
+	};
+	if (input.finalFailureStreak >= 3) return {
+		outcome: "errored",
+		confidence: "medium",
+		isRecent: false
+	};
+	if (input.endedWithRole === "assistant") return {
+		outcome: "completed",
+		confidence: GIVE_UP_PATTERNS.some((re) => re.test(input.lastAssistantText)) ? "low" : "medium",
+		isRecent: false
+	};
+	return {
+		outcome: "unknown",
+		confidence: "low",
+		isRecent: false
+	};
+}
+//#endregion
+//#region src/session-stats/score.ts
+function computeHealthScore(input) {
+	const basis = ["outcome"];
+	if (input.hasToolCalls) basis.push("tool_health");
+	if (input.hasContextData) basis.push("context_pressure");
+	if (input.outcome === "unknown" && input.outcomeConfidence === "low" && basis.length === 1) return {
+		score: null,
+		grade: null,
+		basis,
+		penalties: {}
+	};
+	let score = 100;
+	const penalties = {};
+	if (input.outcome === "errored") {
+		penalties.outcome_errored = 30;
+		score -= 30;
+	} else if (input.outcome === "abandoned") {
+		penalties.outcome_abandoned = 15;
+		score -= 15;
+	}
+	const failurePenalty = Math.min(input.toolFailureSignalCount * 3, 30);
+	if (failurePenalty > 0) {
+		penalties.tool_failures = failurePenalty;
+		score -= failurePenalty;
+	}
+	const retryPenalty = Math.min(input.toolRetryCount * 5, 25);
+	if (retryPenalty > 0) {
+		penalties.tool_retries = retryPenalty;
+		score -= retryPenalty;
+	}
+	const churnPenalty = Math.min(input.editChurnCount * 4, 20);
+	if (churnPenalty > 0) {
+		penalties.edit_churn = churnPenalty;
+		score -= churnPenalty;
+	}
+	if (input.consecutiveFailureMax >= 3) {
+		penalties.consecutive_failures = 10;
+		score -= 10;
+	}
+	if (input.compactionCount >= 2) {
+		const p = Math.min((input.compactionCount - 1) * 5, 15);
+		penalties.compactions = p;
+		score -= p;
+	}
+	if (input.midTaskCompactionCount > 0) {
+		const p = Math.min(input.midTaskCompactionCount * 8, 18);
+		penalties.mid_task_compactions = p;
+		score -= p;
+	}
+	if (input.contextWindow !== null && input.contextWindow > 0 && input.peakContextTokens / input.contextWindow > .9) {
+		penalties.context_pressure_high = 10;
+		score -= 10;
+	}
+	if (score < 0) score = 0;
+	return {
+		score,
+		grade: score >= 90 ? "A" : score >= 75 ? "B" : score >= 60 ? "C" : score >= 40 ? "D" : "F",
+		basis,
+		penalties
+	};
+}
+//#endregion
+//#region src/session-stats/termination.ts
+function classifyTermination(messages, isAlive) {
+	if (messages.length === 0) return isAlive ? "unknown" : "clean";
+	for (const m of messages) for (const c of m.toolCalls) if (c.status === "in_progress") return "tool_call_pending";
+	const last = messages[messages.length - 1];
+	if (!last) return "unknown";
+	if (!isAlive) return "clean";
+	if (last.role === "assistant") return "awaiting_user";
+	return "unknown";
+}
+//#endregion
+//#region src/session-stats/tokens.ts
+function accumulateTokens(messages) {
+	let totalOutput = 0;
+	let hasOutput = false;
+	let peakContext = 0;
+	let hasContext = false;
+	let totalCost = null;
+	for (const m of messages) {
+		if (m.outputTokens !== null) {
+			totalOutput += m.outputTokens;
+			hasOutput = true;
+		}
+		if (m.contextTokens !== null) {
+			if (m.contextTokens > peakContext) peakContext = m.contextTokens;
+			hasContext = true;
+		}
+		if (m.costUsd !== null) totalCost = m.costUsd;
+	}
+	return {
+		totalOutputTokens: totalOutput,
+		hasTotalOutputTokens: hasOutput,
+		peakContextTokens: peakContext,
+		hasPeakContextTokens: hasContext,
+		totalCostUsd: totalCost
+	};
+}
+//#endregion
+//#region src/session-stats/tool-health.ts
+const FAILURE_PATTERNS = [
+	/command not found/i,
+	/Permission denied/,
+	/Traceback \(most recent call last\):/,
+	/^panic: /m,
+	/goroutine \d+ \[/
+];
+const JS_STACK_TRACE = /(?:^|\n)\s+at .+(?:\n\s+at .+){2,}/;
+const EXIT_STATUS_NONZERO = /exit status [1-9]\d*/;
+function isToolCallFailure(call) {
+	if (call.isError) return true;
+	const out = call.output;
+	if (!out) return false;
+	for (const re of FAILURE_PATTERNS) if (re.test(out)) return true;
+	if (JS_STACK_TRACE.test(out)) return true;
+	if ((call.toolName === "Edit" || call.toolName === "Write") && out.includes("FAILED")) return true;
+	if (call.toolName === "Bash" && EXIT_STATUS_NONZERO.test(out)) return true;
+	return false;
+}
+function computeToolHealth(calls) {
+	let failureCount = 0;
+	let currentStreak = 0;
+	let consecutiveMax = 0;
+	for (const c of calls) if (isToolCallFailure(c)) {
+		failureCount++;
+		currentStreak++;
+		if (currentStreak > consecutiveMax) consecutiveMax = currentStreak;
+	} else currentStreak = 0;
+	return {
+		failureCount,
+		consecutiveMax,
+		retryCount: countRetries(calls),
+		finalFailureStreak: countFinalFailureStreak(calls)
+	};
+}
+function countRetries(calls) {
+	let total = 0;
+	let i = 0;
+	while (i < calls.length) {
+		let j = i + 1;
+		const head = calls[i];
+		if (!head) break;
+		while (j < calls.length) {
+			const next = calls[j];
+			if (!next || next.toolName !== head.toolName || next.inputJson !== head.inputJson) break;
+			j++;
+		}
+		const runLen = j - i;
+		if (runLen >= 3) total += runLen - 1;
+		i = j > i ? j : i + 1;
+	}
+	return total;
+}
+function countFinalFailureStreak(calls) {
+	let n = 0;
+	for (let i = calls.length - 1; i >= 0; i--) {
+		const c = calls[i];
+		if (!c) break;
+		if (isToolCallFailure(c)) n++;
+		else break;
+	}
+	return n;
+}
+const FILE_PATH_RE = /"file_path":"([^"\\]*(?:\\.[^"\\]*)*)"/;
+function countEditChurn(calls) {
+	const byFile = /* @__PURE__ */ new Map();
+	for (const c of calls) {
+		if (c.toolName !== "Edit" && c.toolName !== "Write") continue;
+		const m = FILE_PATH_RE.exec(c.inputJson);
+		if (!m?.[1]) continue;
+		const file = m[1];
+		const list = byFile.get(file) ?? [];
+		list.push(c.messageOrdinal);
+		byFile.set(file, list);
+	}
+	let churn = 0;
+	for (const ordinals of byFile.values()) {
+		ordinals.sort((a, b) => a - b);
+		for (let i = 0; i + 2 < ordinals.length; i++) {
+			const lo = ordinals[i];
+			const hi = ordinals[i + 2];
+			if (lo === void 0 || hi === void 0) continue;
+			if (hi - lo < 10) {
+				churn++;
+				break;
+			}
+		}
+	}
+	return churn;
+}
+//#endregion
+//#region src/session-stats/compute.ts
+function computeAllSignals(snap) {
+	const messages = snap.currentMessage ? [...snap.messages, snap.currentMessage] : snap.messages;
+	const isAlive = snap.endedAt === null;
+	const tokens = accumulateTokens(messages);
+	const allCalls = flattenToolCalls(messages);
+	const tools = computeToolHealth(allCalls);
+	const editChurn = countEditChurn(allCalls);
+	const compactionCount = countCompactions(messages);
+	const midTaskCompactionCount = countMidTaskCompactions(messages);
+	const termination = classifyTermination(messages, isAlive);
+	const userMessageCount = messages.filter((m) => m.role === "user").length;
+	const isAutomated = detectAutomated(snap.conversationId, userMessageCount);
+	const turns = messages.filter((m) => m.role === "assistant" && m.outputTokens !== null).length;
+	const endedWithRole = messages[messages.length - 1]?.role ?? null;
+	const lastAssistantText = findLastAssistantText(messages);
+	const outcome = classifyOutcome({
+		isAutomated,
+		messageCount: messages.length,
+		endedWithRole,
+		finalFailureStreak: tools.finalFailureStreak,
+		lastAssistantText,
+		lastActivity: snap.lastActivityAt,
+		now: Date.now()
+	});
+	const health = computeHealthScore({
+		outcome: outcome.outcome,
+		outcomeConfidence: outcome.confidence,
+		hasToolCalls: allCalls.length > 0,
+		hasContextData: tokens.hasPeakContextTokens,
+		toolFailureSignalCount: tools.failureCount,
+		toolRetryCount: tools.retryCount,
+		editChurnCount: editChurn,
+		consecutiveFailureMax: tools.consecutiveMax,
+		compactionCount,
+		midTaskCompactionCount,
+		peakContextTokens: tokens.peakContextTokens,
+		contextWindow: snap.contextWindow
+	});
+	return {
+		conversationId: snap.conversationId,
+		backend: snap.backend,
+		sessionId: snap.sessionId,
+		model: snap.model,
+		startedAt: snap.startedAt,
+		lastActivityAt: snap.lastActivityAt,
+		endedAt: snap.endedAt,
+		messageCount: messages.length,
+		userMessageCount,
+		turns,
+		totalOutputTokens: tokens.totalOutputTokens,
+		hasTotalOutputTokens: tokens.hasTotalOutputTokens,
+		peakContextTokens: tokens.peakContextTokens,
+		hasPeakContextTokens: tokens.hasPeakContextTokens,
+		totalCostUsd: tokens.totalCostUsd,
+		contextWindow: snap.contextWindow,
+		toolCallCount: allCalls.length,
+		toolFailureSignalCount: tools.failureCount,
+		toolRetryCount: tools.retryCount,
+		consecutiveFailureMax: tools.consecutiveMax,
+		finalFailureStreak: tools.finalFailureStreak,
+		editChurnCount: editChurn,
+		compactionCount,
+		midTaskCompactionCount,
+		terminationStatus: termination,
+		outcome: outcome.outcome,
+		outcomeConfidence: outcome.confidence,
+		endedWithRole,
+		healthScore: health.score,
+		healthGrade: health.grade,
+		healthScoreBasis: health.basis,
+		healthPenalties: health.penalties,
+		isAutomated
+	};
+}
+function flattenToolCalls(messages) {
+	const out = [];
+	for (const m of messages) for (const c of m.toolCalls) out.push(c);
+	return out;
+}
+function findLastAssistantText(messages) {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i];
+		if (!m) continue;
+		if (m.role === "assistant" && m.textContent) return m.textContent;
+	}
+	return "";
+}
+function detectAutomated(conversationId, userMessageCount) {
+	if (conversationId.startsWith("cron:")) return true;
+	if (userMessageCount > 1) return false;
+	return false;
+}
+//#endregion
+//#region src/session-stats/recorder.ts
+var SessionRecorder = class {
+	records = /* @__PURE__ */ new Map();
+	start(args) {
+		const now = Date.now();
+		const existing = this.records.get(args.conversationId);
+		if (existing) {
+			existing.backend = args.backend;
+			if (args.model !== void 0) existing.model = args.model;
+			if (args.contextWindow !== void 0) existing.contextWindow = args.contextWindow;
+			existing.lastActivityAt = now;
+			existing.endedAt = null;
+			existing.currentMessage = null;
+			return;
+		}
+		this.records.set(args.conversationId, {
+			conversationId: args.conversationId,
+			backend: args.backend,
+			sessionId: null,
+			model: args.model ?? null,
+			contextWindow: args.contextWindow ?? null,
+			startedAt: now,
+			lastActivityAt: now,
+			endedAt: null,
+			messages: [],
+			currentMessage: null
+		});
+	}
+	recordUserInput(conversationId, text) {
+		const r = this.records.get(conversationId);
+		if (!r) return;
+		this.flushCurrent(r);
+		const now = Date.now();
+		r.lastActivityAt = now;
+		r.messages.push({
+			ordinal: r.messages.length,
+			role: "user",
+			timestamp: now,
+			textContent: text,
+			outputTokens: null,
+			contextTokens: null,
+			costUsd: null,
+			toolCalls: [],
+			isCompactBoundary: false,
+			stopReason: null
+		});
+	}
+	recordEvent(conversationId, event) {
+		const r = this.records.get(conversationId);
+		if (!r) return;
+		r.lastActivityAt = Date.now();
+		switch (event.type) {
+			case "session_meta":
+				r.model = event.model;
+				return;
+			case "text_delta":
+				this.ensureCurrent(r).textContent += event.content;
+				return;
+			case "tool_use": {
+				const cur = this.ensureCurrent(r);
+				cur.toolCalls.push({
+					toolUseId: event.toolUseId,
+					toolName: event.toolName,
+					inputJson: event.input,
+					output: "",
+					isError: false,
+					status: "in_progress",
+					messageOrdinal: cur.ordinal
+				});
+				return;
+			}
+			case "tool_result":
+				if (this.attachToolResult(r.currentMessage, event)) return;
+				for (let i = r.messages.length - 1; i >= 0; i--) {
+					const msg = r.messages[i];
+					if (!msg) continue;
+					if (this.attachToolResult(msg, event)) return;
+				}
+				return;
+			case "turn_complete": {
+				if (event.sessionId) r.sessionId = event.sessionId;
+				if (event.contextWindow != null) r.contextWindow = event.contextWindow;
+				const cur = r.currentMessage;
+				if (cur) {
+					cur.outputTokens = event.outputTokens ?? null;
+					cur.contextTokens = event.inputTokens ?? null;
+					cur.costUsd = event.costUsd ?? null;
+					r.messages.push(cur);
+					r.currentMessage = null;
+				}
+				return;
+			}
+			case "error":
+				if (event.sessionId) r.sessionId = event.sessionId;
+				this.flushCurrent(r);
+				return;
+			case "thinking_delta": return;
+		}
+	}
+	end(conversationId) {
+		const r = this.records.get(conversationId);
+		if (!r) return;
+		this.flushCurrent(r);
+		r.endedAt = Date.now();
+	}
+	delete(conversationId) {
+		this.records.delete(conversationId);
+	}
+	has(conversationId) {
+		return this.records.has(conversationId);
+	}
+	compute(conversationId) {
+		const r = this.records.get(conversationId);
+		if (!r) return null;
+		return computeAllSignals({
+			conversationId: r.conversationId,
+			backend: r.backend,
+			sessionId: r.sessionId,
+			model: r.model,
+			contextWindow: r.contextWindow,
+			startedAt: r.startedAt,
+			lastActivityAt: r.lastActivityAt,
+			endedAt: r.endedAt,
+			messages: r.messages,
+			currentMessage: r.currentMessage
+		});
+	}
+	ensureCurrent(r) {
+		if (r.currentMessage) return r.currentMessage;
+		const cur = {
+			ordinal: r.messages.length,
+			role: "assistant",
+			timestamp: Date.now(),
+			textContent: "",
+			outputTokens: null,
+			contextTokens: null,
+			costUsd: null,
+			toolCalls: [],
+			isCompactBoundary: false,
+			stopReason: null
+		};
+		r.currentMessage = cur;
+		return cur;
+	}
+	flushCurrent(r) {
+		if (!r.currentMessage) return;
+		r.messages.push(r.currentMessage);
+		r.currentMessage = null;
+	}
+	attachToolResult(msg, event) {
+		if (!msg) return false;
+		const idx = msg.toolCalls.findIndex((c) => c.toolUseId === event.toolUseId);
+		if (idx === -1) return false;
+		const call = msg.toolCalls[idx];
+		if (!call) return false;
+		call.output = event.output;
+		call.isError = event.isError;
+		call.status = "completed";
+		return true;
+	}
+};
+//#endregion
 //#region src/session-store.ts
 function migrate(db) {
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS sessions (
 			conversation_id TEXT PRIMARY KEY,
 			claude_session_id TEXT NOT NULL,
+			backend TEXT NOT NULL DEFAULT 'claude',
 			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
 			updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 		)
 	`);
-	db.exec(`
-		CREATE TABLE IF NOT EXISTS session_stats (
-			conversation_id TEXT PRIMARY KEY,
-			claude_session_id TEXT,
-			model TEXT,
-			total_input_tokens INTEGER NOT NULL DEFAULT 0,
-			total_output_tokens INTEGER NOT NULL DEFAULT 0,
-			total_cost_usd REAL,
-			turns INTEGER NOT NULL DEFAULT 0,
-			context_window INTEGER,
-			created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-			updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-		)
-	`);
-	if (!db.prepare("PRAGMA table_info(sessions)").all().some((c) => c.name === "backend")) db.exec("ALTER TABLE sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'claude'");
-	if (!db.prepare("PRAGMA table_info(session_stats)").all().some((c) => c.name === "backend")) db.exec("ALTER TABLE session_stats ADD COLUMN backend TEXT");
 }
 function createSessionStore(dbPath) {
 	mkdirSync(dirname(dbPath), { recursive: true });
@@ -3184,25 +4242,6 @@ function createSessionStore(dbPath) {
 			updated_at = unixepoch()
 	`);
 	const deleteStmt = db.prepare("DELETE FROM sessions WHERE conversation_id = ?");
-	const getStatsStmt = db.prepare("SELECT * FROM session_stats WHERE conversation_id = ?");
-	const upsertStatsStmt = db.prepare(`
-		INSERT INTO session_stats (
-			conversation_id, claude_session_id, backend, model,
-			total_input_tokens, total_output_tokens, total_cost_usd,
-			turns, context_window, created_at, updated_at
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, unixepoch(), unixepoch())
-		ON CONFLICT(conversation_id) DO UPDATE SET
-			claude_session_id = COALESCE(excluded.claude_session_id, session_stats.claude_session_id),
-			backend = COALESCE(excluded.backend, session_stats.backend),
-			model = COALESCE(excluded.model, session_stats.model),
-			total_input_tokens = session_stats.total_input_tokens + excluded.total_input_tokens,
-			total_output_tokens = session_stats.total_output_tokens + excluded.total_output_tokens,
-			total_cost_usd = COALESCE(excluded.total_cost_usd, session_stats.total_cost_usd),
-			turns = session_stats.turns + 1,
-			context_window = COALESCE(excluded.context_window, session_stats.context_window),
-			updated_at = unixepoch()
-	`);
 	return {
 		getSession(conversationId) {
 			const row = getStmt.get(conversationId);
@@ -3218,26 +4257,6 @@ function createSessionStore(dbPath) {
 		},
 		deleteSession(conversationId) {
 			deleteStmt.run(conversationId);
-		},
-		getStats(conversationId) {
-			const row = getStatsStmt.get(conversationId);
-			if (!row) return null;
-			return {
-				conversationId: row.conversation_id,
-				backend: row.backend && isBackendId(row.backend) ? row.backend : null,
-				claudeSessionId: row.claude_session_id,
-				model: row.model,
-				totalInputTokens: row.total_input_tokens,
-				totalOutputTokens: row.total_output_tokens,
-				totalCostUsd: row.total_cost_usd,
-				turns: row.turns,
-				contextWindow: row.context_window,
-				createdAt: row.created_at,
-				updatedAt: row.updated_at
-			};
-		},
-		updateStats(conversationId, update) {
-			upsertStatsStmt.run(conversationId, update.claudeSessionId ?? null, update.backend ?? null, update.model ?? null, update.inputTokens ?? 0, update.outputTokens ?? 0, update.costUsd ?? null, update.contextWindow ?? null);
 		},
 		close() {
 			db.close();
@@ -3318,6 +4337,21 @@ var TelegramClient = class {
 	}
 	async deleteMessage(params) {
 		await this.call("deleteMessage", { ...params });
+	}
+	/**
+	* Set or clear emoji reactions on a message. Used to acknowledge queued
+	* messages without spamming the chat with text replies. Pass an empty
+	* `emojis` array to clear reactions. Bot API 7.0+.
+	*/
+	async setMessageReaction(params) {
+		await this.call("setMessageReaction", {
+			chat_id: params.chat_id,
+			message_id: params.message_id,
+			reaction: params.emojis.map((emoji) => ({
+				type: "emoji",
+				emoji
+			}))
+		});
 	}
 	async setWebhook(url, secret) {
 		const params = { url };
@@ -3403,8 +4437,10 @@ async function runInstance({ instancePath }) {
 	watchAccessConfig(config.accessFile, (updated) => {
 		access = updated;
 	}, log);
+	const bindings = loadBindingConfig(config.bindingsFile, log);
 	const sessionStore = createSessionStore(config.sessionDbPath);
 	log.info({ dbPath: config.sessionDbPath }, "session store ready");
+	const sessionRecorder = new SessionRecorder();
 	mkdirSync(config.claudeWorkingDir, { recursive: true });
 	const conversationLogDir = config.conversationLogDir;
 	const migrated = migrateConversationLogs(conversationLogDir);
@@ -3443,6 +4479,7 @@ async function runInstance({ instancePath }) {
 			backends,
 			stateStore: cronStateStore,
 			sessionStore,
+			sessionRecorder,
 			conversationLogger,
 			log,
 			defaultWorkingDir: config.claudeWorkingDir,
@@ -3469,13 +4506,15 @@ async function runInstance({ instancePath }) {
 		botUsername: me.username ?? "",
 		getAccess: () => access,
 		sessionStore,
+		sessionRecorder,
 		backends,
 		pendingBackends,
 		conversationLogger,
 		cronScheduler,
 		promptsDir: config.promptsDir,
 		cronFilePath: config.cronFile,
-		conversationLogDir
+		conversationLogDir,
+		bindings
 	};
 	const ac = new AbortController();
 	const stopWatchdog = startWatchdog(log);
@@ -3527,8 +4566,12 @@ async function runWebhook(client, log, config, ac, handlerOpts, startedAt) {
 async function registerCronCommands(client, config, log) {
 	const commands = [
 		{
-			command: "new",
-			description: "Start a fresh conversation"
+			command: "new_claude",
+			description: "Start fresh — use Claude"
+		},
+		{
+			command: "new_codex",
+			description: "Start fresh — use Codex"
 		},
 		{
 			command: "stats",
@@ -3547,7 +4590,7 @@ async function registerCronCommands(client, config, log) {
 		await client.setMyCommands(commands);
 		log.info({
 			count: commands.length,
-			cron: commands.length - 3
+			cron: commands.length - 4
 		}, "registered bot commands");
 	} catch (err) {
 		log.error({ err }, "setMyCommands failed — continuing without refresh");

@@ -12,6 +12,7 @@ const configSchema = z.object({
 	instancePath: z.string().min(1),
 	accessFile: z.string().min(1),
 	cronFile: z.string().min(1),
+	bindingsFile: z.string().min(1),
 	sessionDbPath: z.string().min(1),
 	logDir: z.string().min(1),
 	conversationLogDir: z.string().min(1),
@@ -62,6 +63,8 @@ export function loadConfig({ instancePath }: LoadConfigOptions): Config {
 		accessFile:
 			process.env.ACCESS_FILE || join(instancePath, "config/access.json"),
 		cronFile: process.env.CRON_FILE || join(instancePath, "config/crons.json"),
+		bindingsFile:
+			process.env.BINDINGS_FILE || join(instancePath, "config/bindings.json"),
 		sessionDbPath:
 			process.env.SESSION_DB_PATH || join(instancePath, "data/sessions.db"),
 		logDir: process.env.LOG_DIR || join(instancePath, "data/logs"),

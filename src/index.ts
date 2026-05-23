@@ -13,6 +13,7 @@ import type {
 	BackendId,
 	BackendPool,
 } from "./backend.js";
+import { loadBindingConfig } from "./binding-config.js";
 import { ProcessPool } from "./claude-bridge.js";
 import type { HandleUpdateOptions } from "./claude-handler.js";
 import { CodexCronProcessPool, CodexProcessPool } from "./codex-bridge.js";
@@ -34,6 +35,7 @@ import type { Logger } from "./logger.js";
 import { createLogger } from "./logger.js";
 import { startPolling } from "./poller.js";
 import { createApp } from "./server.js";
+import { SessionRecorder } from "./session-stats/index.js";
 import { createSessionStore } from "./session-store.js";
 import {
 	notifyReady,
@@ -68,8 +70,12 @@ export async function runInstance({
 		log,
 	);
 
+	const bindings = loadBindingConfig(config.bindingsFile, log);
+
 	const sessionStore = createSessionStore(config.sessionDbPath);
 	log.info({ dbPath: config.sessionDbPath }, "session store ready");
+
+	const sessionRecorder = new SessionRecorder();
 
 	mkdirSync(config.claudeWorkingDir, { recursive: true });
 
@@ -134,6 +140,7 @@ export async function runInstance({
 			backends,
 			stateStore: cronStateStore,
 			sessionStore,
+			sessionRecorder,
 			conversationLogger,
 			log,
 			defaultWorkingDir: config.claudeWorkingDir,
@@ -167,6 +174,7 @@ export async function runInstance({
 		botUsername: me.username ?? "",
 		getAccess: () => access,
 		sessionStore,
+		sessionRecorder,
 		backends,
 		pendingBackends,
 		conversationLogger,
@@ -174,6 +182,7 @@ export async function runInstance({
 		promptsDir: config.promptsDir,
 		cronFilePath: config.cronFile,
 		conversationLogDir,
+		bindings,
 	};
 
 	const ac = new AbortController();
@@ -245,8 +254,11 @@ async function registerCronCommands(
 	config: CronConfig,
 	log: Logger,
 ): Promise<void> {
+	// Telegram bot commands only allow [a-z0-9_], so the menu uses
+	// underscores; the parser accepts both `_` and `-` for forgiveness.
 	const commands = [
-		{ command: "new", description: "Start a fresh conversation" },
+		{ command: "new_claude", description: "Start fresh — use Claude" },
+		{ command: "new_codex", description: "Start fresh — use Codex" },
 		{ command: "stats", description: "Show session statistics" },
 		{ command: "cron", description: "Manage cron jobs" },
 		...config.jobs
@@ -259,7 +271,7 @@ async function registerCronCommands(
 	try {
 		await client.setMyCommands(commands);
 		log.info(
-			{ count: commands.length, cron: commands.length - 3 },
+			{ count: commands.length, cron: commands.length - 4 },
 			"registered bot commands",
 		);
 	} catch (err) {

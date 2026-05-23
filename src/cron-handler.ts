@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { BackendBridgeOptions, BackendRegistry } from "./backend.js";
+import type {
+	BackendBridgeOptions,
+	BackendRegistry,
+	BackendStreamEvent,
+	ConversationProcess,
+} from "./backend.js";
 import { sendMessageWithAuthRetry } from "./claude-bridge.js";
 import { ensureFreshCliToken } from "./cli-token-warmup.js";
 import type { ConversationLogger } from "./conversation-logger.js";
@@ -9,10 +14,49 @@ import type { CronStateStore } from "./cron-state.js";
 import type { Logger } from "./logger.js";
 import { buildSystemPrompt } from "./prompt-builder.js";
 import { RequestTimer } from "./request-timer.js";
+import type { SessionRecorder } from "./session-stats/index.js";
 import type { SessionStore } from "./session-store.js";
 import { consumeEvents, streamToTelegram } from "./streaming.js";
 import type { TelegramClient } from "./telegram-client.js";
 import type { ContentBlock } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Cron is one-shot: send the prompt, stream events, then close the proc so
+// the stream ends and the cron returns. The bridge's stream is now long-
+// lived (no internal idle timer), so cron has to drive its own end-of-run
+// detection. After every `turn_complete` we arm an idle timer; if no
+// further event arrives within CRON_IDLE_CLOSE_MS, we assume the agent
+// loop is fully done (no pending CLI-driven auto-continuation) and close
+// stdin, which lets the CLI exit cleanly. Any event arriving inside the
+// window cancels the timer.
+// ---------------------------------------------------------------------------
+
+const CRON_IDLE_CLOSE_MS = 30_000;
+
+async function* withCronIdleClose<E extends BackendStreamEvent>(
+	source: AsyncIterable<E>,
+	closeProc: () => void,
+	idleMs: number,
+): AsyncGenerator<E> {
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	const cancel = () => {
+		if (timer) {
+			clearTimeout(timer);
+			timer = null;
+		}
+	};
+	try {
+		for await (const ev of source) {
+			cancel();
+			yield ev;
+			if (ev.type === "turn_complete") {
+				timer = setTimeout(closeProc, idleMs);
+			}
+		}
+	} finally {
+		cancel();
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Transient error detection
@@ -82,6 +126,7 @@ export interface CronHandlerDeps {
 	backends: BackendRegistry;
 	stateStore: CronStateStore;
 	sessionStore: SessionStore;
+	sessionRecorder: SessionRecorder;
 	conversationLogger: ConversationLogger;
 	log: Logger;
 	defaultWorkingDir: string;
@@ -160,12 +205,39 @@ export async function executeCronJob(
 		}
 
 		const content: ContentBlock[] = [{ type: "text", text: prompt }];
+		const cronConvId = `cron:${job.id}`;
+		deps.sessionRecorder.start({
+			conversationId: cronConvId,
+			backend: backendId,
+		});
+		deps.sessionRecorder.recordUserInput(cronConvId, prompt);
+		const recordEvent = (ev: BackendStreamEvent) =>
+			deps.sessionRecorder.recordEvent(cronConvId, ev);
+
+		// Spawn synchronously so the idle-close wrapper has a definite proc
+		// reference. On auth retry, the respawn closure produces a fresh proc
+		// and we update `currentProc`.
+		let currentProc: ConversationProcess = cronPool.create(
+			runKey,
+			jobOptsArg,
+			timer,
+		);
 		const events = sendMessageWithAuthRetry(
-			() => cronPool.create(runKey, jobOptsArg, timer),
+			currentProc,
+			() => {
+				currentProc = cronPool.create(runKey, jobOptsArg, timer);
+				return currentProc;
+			},
 			() => cronPool.remove(runKey),
 			content,
 			timer,
 			log,
+		);
+
+		const wrapped = withCronIdleClose(
+			events,
+			() => currentProc.close(),
+			CRON_IDLE_CLOSE_MS,
 		);
 
 		const chatId = opts.overrideChatId ?? job.chatId;
@@ -179,13 +251,16 @@ export async function executeCronJob(
 					chatId,
 					messageThreadId: threadId,
 				},
-				events,
+				wrapped,
 				log,
 				timer,
+				recordEvent,
 			);
 		} else {
-			result = await consumeEvents(events, timer);
+			result = await consumeEvents(wrapped, timer, recordEvent);
 		}
+
+		deps.sessionRecorder.end(cronConvId);
 
 		timer.mark("done");
 		const timings = timer.summary();
@@ -193,8 +268,6 @@ export async function executeCronJob(
 		const failureReason =
 			result.error ?? (result.interrupted ? "stream interrupted" : null);
 
-		// Log to conversation logger and update stats
-		const cronConvId = `cron:${job.id}`;
 		conversationLogger.log({
 			timestamp: new Date().toISOString(),
 			conversationId: cronConvId,
@@ -206,15 +279,6 @@ export async function executeCronJob(
 			durationMs: timings.total ?? 0,
 			timings,
 			error: failureReason,
-		});
-		deps.sessionStore.updateStats(cronConvId, {
-			backend: backendId,
-			claudeSessionId: result.sessionId,
-			model: result.model,
-			inputTokens: result.inputTokens,
-			outputTokens: result.outputTokens,
-			costUsd: result.costUsd,
-			contextWindow: result.contextWindow,
 		});
 
 		if (failureReason) {

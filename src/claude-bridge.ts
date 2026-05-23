@@ -5,7 +5,6 @@ import { type Interface, createInterface } from "node:readline";
 import { Translator, parseLine } from "claude-code-parser";
 import type {
 	BackendBridgeOptions,
-	BackendCronPool,
 	BackendPool,
 	BackendStreamEvent,
 	ConversationProcess,
@@ -18,20 +17,21 @@ import type { ContentBlock } from "./types.js";
 export type ClaudeStreamEvent = BackendStreamEvent;
 
 /** Raw SSE event embedded inside a stream_event NDJSON line. */
-interface StreamEventDelta {
-	type: string;
+export interface StreamEventDelta {
+	type?: string;
 	text?: string;
 	thinking?: string;
 	partial_json?: string;
+	stop_reason?: string | null;
 }
 
-interface StreamEventContentBlock {
+export interface StreamEventContentBlock {
 	type: string;
 	id?: string;
 	name?: string;
 }
 
-interface StreamEventInner {
+export interface StreamEventInner {
 	type: string;
 	content_block?: StreamEventContentBlock;
 	delta?: StreamEventDelta;
@@ -39,7 +39,7 @@ interface StreamEventInner {
 }
 
 /** The NDJSON line shape for `type: "stream_event"` entries. */
-interface StreamEventLine {
+export interface StreamEventLine {
 	type: "stream_event";
 	event: StreamEventInner;
 	session_id?: string;
@@ -52,7 +52,9 @@ const DEFAULT_SYSTEM_PROMPT =
 	"You are responding via a Telegram bot. Be concise and direct. Do not quote the user's message back to them. Do not use markdown headers. Keep responses short unless the task requires detail.";
 
 // ---------------------------------------------------------------------------
-// EventQueue — async iterable that bridges push (line handler) → pull (for-await)
+// EventQueue — simple push/pull async iterator. One queue per ClaudeProcess
+// lifetime; ends only when the process closes (or a fatal error fires). All
+// turns and all CLI-driven auto-continuations flow through the same queue.
 // ---------------------------------------------------------------------------
 
 class EventQueue implements AsyncIterableIterator<BackendStreamEvent> {
@@ -63,6 +65,7 @@ class EventQueue implements AsyncIterableIterator<BackendStreamEvent> {
 	private ended = false;
 
 	push(event: BackendStreamEvent): void {
+		if (this.ended) return;
 		if (this.waiting) {
 			const resolve = this.waiting;
 			this.waiting = null;
@@ -73,6 +76,7 @@ class EventQueue implements AsyncIterableIterator<BackendStreamEvent> {
 	}
 
 	end(): void {
+		if (this.ended) return;
 		this.ended = true;
 		if (this.waiting) {
 			const resolve = this.waiting;
@@ -107,8 +111,14 @@ class EventQueue implements AsyncIterableIterator<BackendStreamEvent> {
 	}
 }
 
+// Re-exported for tests that want to drive a queue directly.
+export { EventQueue };
+
 // ---------------------------------------------------------------------------
-// ClaudeProcess — persistent CLI subprocess accepting multiple turns via stdin
+// ClaudeProcess — persistent CLI subprocess, one per conversation. Multiple
+// user inputs and any CLI-driven auto-continuations all flow through a single
+// long-lived event stream. The handler decides "is Claude busy?" via the
+// `quiescent` flag and queues follow-up inputs accordingly.
 // ---------------------------------------------------------------------------
 
 export class ClaudeProcess implements ConversationProcess {
@@ -116,12 +126,20 @@ export class ClaudeProcess implements ConversationProcess {
 	private rl: Interface;
 	private translator = new Translator();
 	private streamParser = new StreamEventParser();
-	private queue: EventQueue | null = null;
+	private readonly events = new EventQueue();
 	private _sessionId: string | null = null;
 	private _alive = true;
 	private stderr = "";
 	private turnTimer: RequestTimer | null = null;
 	private firstEventMarked = false;
+
+	// Tool calls awaiting their tool_result. While non-empty, the model is
+	// definitely mid-turn — do not declare quiescent.
+	private openToolCalls = new Set<string>();
+	// True while a turn is in flight: cleared on turn_complete-with-no-open-tools.
+	// Drives `quiescent` = !active && alive.
+	private active = false;
+	private quiescentListeners = new Set<() => void>();
 
 	constructor(opts: BackendBridgeOptions, resumeSessionId?: string | null) {
 		const args = [
@@ -242,23 +260,19 @@ export class ClaudeProcess implements ConversationProcess {
 
 		this.proc.on("close", (code) => {
 			this._alive = false;
-			if (this.queue) {
-				if (code !== 0 && code !== null) {
-					this.queue.push({
-						type: "error",
-						message:
-							this.stderr.trim() || `Claude CLI exited with code ${code}`,
-					});
-				}
-				this.queue.end();
-				this.queue = null;
+			if (code !== 0 && code !== null) {
+				this.events.push({
+					type: "error",
+					message: this.stderr.trim() || `Claude CLI exited with code ${code}`,
+				});
 			}
+			this.events.end();
+			this.quiescentListeners.clear();
 		});
 	}
 
 	private handleLine(line: string): void {
 		if (!line.trim()) return;
-		if (!this.queue) return;
 
 		const parsed = parseLine(line);
 		if (!parsed) return;
@@ -273,9 +287,7 @@ export class ClaudeProcess implements ConversationProcess {
 			const events = this.streamParser.process(
 				parsed as unknown as StreamEventLine,
 			);
-			for (const ev of events) {
-				this.queue.push(ev);
-			}
+			for (const ev of events) this.publish(ev);
 			return;
 		}
 
@@ -285,53 +297,100 @@ export class ClaudeProcess implements ConversationProcess {
 		// Use Translator for system, result, user events
 		const events = this.translator.translate(parsed);
 		for (const event of events) {
-			this.queue.push(event);
-
-			// turn_complete or error signals end of this turn
-			if (event.type === "turn_complete") {
-				if (event.sessionId) this._sessionId = event.sessionId;
-				this.queue.end();
-				this.queue = null;
-				return;
+			if (event.type === "turn_complete" && event.sessionId) {
+				this._sessionId = event.sessionId;
 			}
-			if (event.type === "error") {
-				if ("sessionId" in event && event.sessionId) {
-					this._sessionId = event.sessionId as string;
-				}
-				this.queue.end();
-				this.queue = null;
-				return;
+			if (event.type === "error" && "sessionId" in event && event.sessionId) {
+				this._sessionId = event.sessionId as string;
+			}
+			this.publish(event);
+		}
+	}
+
+	/**
+	 * Push an event into the long-lived stream and update the active/quiescent
+	 * state machine. We track open tool calls so a multi-second tool run never
+	 * looks "idle"; we only flip back to quiescent once turn_complete fires
+	 * with no tool result still pending.
+	 */
+	private publish(event: BackendStreamEvent): void {
+		// Any inbound event means there's activity — a fresh agent-loop step
+		// (CLI auto-continuation) may have started after a previous quiescent.
+		if (
+			event.type === "text_delta" ||
+			event.type === "thinking_delta" ||
+			event.type === "tool_use" ||
+			event.type === "tool_result"
+		) {
+			this.active = true;
+		}
+		if (event.type === "tool_use") {
+			this.openToolCalls.add(event.toolUseId);
+		} else if (event.type === "tool_result") {
+			this.openToolCalls.delete(event.toolUseId);
+		}
+
+		this.events.push(event);
+
+		if (event.type === "turn_complete") {
+			if (event.sessionId) this._sessionId = event.sessionId;
+			this.openToolCalls.clear();
+			this.markQuiescent();
+		}
+	}
+
+	private markQuiescent(): void {
+		if (!this.active) return;
+		this.active = false;
+		// Snapshot listeners — a callback may unsubscribe or send new input
+		// (which flips active back to true) and we don't want to skip peers.
+		const snapshot = [...this.quiescentListeners];
+		for (const cb of snapshot) {
+			try {
+				cb();
+			} catch {
+				// Listener errors must not break the bridge.
 			}
 		}
 	}
 
-	sendMessage(
-		content: ContentBlock[],
-		timer?: RequestTimer,
-	): AsyncIterableIterator<BackendStreamEvent> {
+	stream(): AsyncIterable<BackendStreamEvent> {
+		return this.events;
+	}
+
+	sendInput(content: ContentBlock[], timer?: RequestTimer): void {
+		if (!this._alive) return;
 		this.turnTimer = timer ?? null;
 		this.firstEventMarked = false;
-		// Fresh parsers per turn to avoid state leakage
+		// Fresh parsers per input — defensive against state leaking across
+		// turns when the CLI emits unusual sequences.
 		this.translator = new Translator();
 		this.streamParser = new StreamEventParser();
-
-		const queue = new EventQueue();
-		this.queue = queue;
+		// Optimistically mark active so the quiescent gate flips immediately.
+		// Otherwise a fast caller could observe quiescent === true between
+		// the stdin write and the first event from the CLI.
+		this.active = true;
 
 		timer?.mark("message_sent");
 
 		const msg = JSON.stringify({
 			type: "user",
 			session_id: "",
-			message: {
-				role: "user",
-				content,
-			},
+			message: { role: "user", content },
 			parent_tool_use_id: null,
 		});
 		this.proc.stdin?.write(`${msg}\n`);
+	}
 
-		return queue;
+	get quiescent(): boolean {
+		return !this.active && this._alive;
+	}
+
+	onQuiescent(cb: () => void): () => void {
+		this.quiescentListeners.add(cb);
+		return () => {
+			this.quiescentListeners.delete(cb);
+		};
 	}
 
 	close(): void {
@@ -412,8 +471,8 @@ export function isAuthError(message: string): boolean {
 }
 
 /**
- * Turn a Claude CLI subprocess invocation into a stream of events, with a
- * single transparent retry if the first attempt fails with an OAuth 401.
+ * Spawn a CLI subprocess and submit one user message, with a single transparent
+ * retry if the first attempt fails with an OAuth 401.
  *
  * Background: the `claude` CLI reads `~/.claude/.credentials.json` on
  * startup. If the cached access token has just expired, the subprocess
@@ -424,11 +483,11 @@ export function isAuthError(message: string): boolean {
  * then longer delay, since the refresh window can occasionally run past
  * a single 2-second wait.
  *
- * Events are buffered until we either (a) see the first user-visible
- * output — `text_delta`, `tool_use`, `tool_result`, or `turn_complete` —
- * at which point we're committed and stream through untouched, or (b)
- * see an `error` event. An auth error on the first attempt triggers a
- * respawn; anything else is yielded normally.
+ * Returned events are buffered until we either (a) see the first user-
+ * visible output — `text_delta`, `tool_use`, `tool_result`, or
+ * `turn_complete` — at which point we're committed and stream through
+ * untouched, or (b) see an `error` event. An auth error on the first
+ * attempt triggers a respawn; anything else is yielded normally.
  */
 export interface AuthRetryOptions {
 	/** Max total attempts including the first. Default 3 (two retries). */
@@ -445,14 +504,13 @@ export interface AuthRetryOptions {
 
 /** Minimal surface we need from ClaudeProcess — keeps this testable. */
 export interface ClaudeProcessLike {
-	sendMessage(
-		content: ContentBlock[],
-		timer?: RequestTimer,
-	): AsyncIterable<BackendStreamEvent>;
+	sendInput(content: ContentBlock[], timer?: RequestTimer): void;
+	stream(): AsyncIterable<BackendStreamEvent>;
 }
 
 export async function* sendMessageWithAuthRetry(
-	spawnProcess: () => ClaudeProcessLike,
+	initialProc: ClaudeProcessLike,
+	respawnProcess: () => ClaudeProcessLike,
 	removeProcess: () => void,
 	content: ContentBlock[],
 	timer: RequestTimer | undefined,
@@ -463,17 +521,21 @@ export async function* sendMessageWithAuthRetry(
 	const retryDelaysMs = options.retryDelaysMs ?? [2_000, 5_000];
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-		if (attempt > 1) {
+		let proc: ClaudeProcessLike;
+		if (attempt === 1) {
+			proc = initialProc;
+		} else {
 			removeProcess();
 			const delayIdx = Math.min(attempt - 2, retryDelaysMs.length - 1);
 			const delay = retryDelaysMs[delayIdx] ?? 0;
 			if (delay > 0) {
 				await new Promise((r) => setTimeout(r, delay));
 			}
+			proc = respawnProcess();
 		}
 
-		const proc = spawnProcess();
-		const iter = proc.sendMessage(content, timer)[Symbol.asyncIterator]();
+		proc.sendInput(content, timer);
+		const iter = proc.stream()[Symbol.asyncIterator]();
 
 		const buffered: BackendStreamEvent[] = [];
 		let retry = false;
@@ -526,8 +588,15 @@ export async function* sendMessageWithAuthRetry(
 }
 
 // ---------------------------------------------------------------------------
-// StreamEventParser (unchanged)
+// StreamEventParser
 // ---------------------------------------------------------------------------
+
+const FINAL_STOP_REASONS = new Set([
+	"end_turn",
+	"stop_sequence",
+	"max_tokens",
+	"refusal",
+]);
 
 /**
  * Stateful parser for `stream_event` envelopes from Claude Code.
@@ -543,16 +612,39 @@ export async function* sendMessageWithAuthRetry(
  * State is needed to accumulate `input_json_delta` fragments into a
  * complete tool input JSON string before emitting the tool_use event.
  */
-class StreamEventParser {
+export class StreamEventParser {
 	private pendingToolUseId = "";
 	private pendingToolName = "";
 	private pendingToolInput = "";
+	private pendingStopReason: string | null = null;
 
 	process(raw: StreamEventLine): BackendStreamEvent[] {
 		const event = raw.event;
 		if (!event) return [];
 
 		switch (event.type) {
+			case "message_start":
+				this.pendingStopReason = null;
+				return [];
+
+			case "message_delta":
+				if (event.delta?.stop_reason != null) {
+					this.pendingStopReason = event.delta.stop_reason;
+				}
+				return [];
+
+			case "message_stop": {
+				const stopReason = this.pendingStopReason;
+				this.pendingStopReason = null;
+				if (stopReason && FINAL_STOP_REASONS.has(stopReason)) {
+					const ev: BackendStreamEvent = raw.session_id
+						? { type: "turn_complete", sessionId: raw.session_id }
+						: { type: "turn_complete" };
+					return [ev];
+				}
+				return [];
+			}
+
 			case "content_block_start": {
 				const block = event.content_block;
 				if (block?.type === "tool_use") {

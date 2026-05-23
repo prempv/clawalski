@@ -21,19 +21,30 @@ export interface BackendBridgeOptions {
 	cronFilePath?: string;
 }
 
-/** Stream event shape exposed to the renderer. Same as Claude's RelayEvent. */
+/** Stream event shape exposed to the renderer. */
 export type BackendStreamEvent = RelayEvent;
 
 /**
  * Per-conversation handle. For Claude this is a literal long-lived
  * subprocess; for Codex it's a thin wrapper that spawns a fresh
  * `codex exec resume` per turn.
+ *
+ * Lifetime model:
+ * - `stream()` returns one persistent event stream for the entire process
+ *   lifetime. Multiple `sendInput` calls (across multiple user turns and any
+ *   CLI-driven auto-continuations) all flow into this single stream. Ends
+ *   only when the process closes or dies.
+ * - `quiescent` is true when no turn is in flight — last meaningful event
+ *   was `turn_complete` and no tool call is open. Use it as the "is the
+ *   model busy?" gate for queueing follow-up user inputs.
+ * - `onQuiescent(cb)` fires the callback each time we transition into a
+ *   quiescent state, so callers can flush a queue without polling.
  */
 export interface ConversationProcess {
-	sendMessage(
-		content: ContentBlock[],
-		timer?: RequestTimer,
-	): AsyncIterableIterator<BackendStreamEvent>;
+	stream(): AsyncIterable<BackendStreamEvent>;
+	sendInput(content: ContentBlock[], timer?: RequestTimer): void;
+	readonly quiescent: boolean;
+	onQuiescent(cb: () => void): () => void;
 	close(): void;
 	readonly alive: boolean;
 	readonly sessionId: string | null;

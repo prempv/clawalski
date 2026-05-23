@@ -1,0 +1,25 @@
+{
+  "bindings": [
+    {
+      "chatId": 123456789,
+      "workingDir": "/home/dev/work/journal",
+      "prompt": "DM-only journaling space. Default to writing into ~/journal/ when asked to record something."
+    },
+    {
+      "chatId": -1001234567890,
+      "workingDir": "/home/dev/work/my-project",
+      "prompt": "You are working in the my-project monorepo. Run `pnpm typecheck && pnpm lint && pnpm test` before declaring work done."
+    },
+    {
+      "chatId": -1001234567890,
+      "threadId": 42,
+      "workingDir": "/home/dev/work/my-project/services/api",
+      "prompt": "API service topic. Default cwd is services/api. When changing routes, also update the OpenAPI spec at services/api/openapi.yaml."
+    },
+    {
+      "chatId": -1001234567890,
+      "threadId": 88,
+      "prompt": "Infra topic. No working-dir override here — stays in the default workspace, but always think about blast radius before suggesting destructive ops."
+    }
+  ]
+}
