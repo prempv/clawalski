@@ -4,7 +4,7 @@ import type { BackendId } from "./backend.js";
 import type { Logger } from "./logger.js";
 import type { MessageContext } from "./message-context.js";
 
-const backendIdSchema = z.enum(["claude", "codex"]);
+const backendIdSchema = z.enum(["claude", "claude-v2", "codex"]);
 
 const accessFileSchema = z.object({
 	dmPolicy: z.enum(["open", "allowlist"]).default("open"),
@@ -90,11 +90,11 @@ export function watchAccessConfig(
 	filePath: string,
 	onChange: (config: AccessConfig) => void,
 	log: Logger,
-): void {
+): () => void {
 	let debounce: ReturnType<typeof setTimeout> | null = null;
 
 	try {
-		watch(filePath, () => {
+		const watcher = watch(filePath, () => {
 			if (debounce) clearTimeout(debounce);
 			debounce = setTimeout(() => {
 				try {
@@ -107,8 +107,15 @@ export function watchAccessConfig(
 			}, 300);
 		});
 		log.info({ filePath }, "watching access config for changes");
+		return () => {
+			if (debounce) clearTimeout(debounce);
+			watcher.close();
+		};
 	} catch {
 		log.warn({ filePath }, "could not watch access config file");
+		return () => {
+			if (debounce) clearTimeout(debounce);
+		};
 	}
 }
 

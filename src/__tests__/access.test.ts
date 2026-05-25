@@ -174,6 +174,21 @@ describe("loadAccessConfig", () => {
 		const config = loadAccessConfig(filePath);
 		expect(config.adminChatId).toBe(12345);
 	});
+
+	it("loads claude-v2 as the channel default backend", async () => {
+		const filePath = join(tmpDir, "access.json");
+		await writeFile(
+			filePath,
+			JSON.stringify({
+				dmDefaultBackend: "claude-v2",
+				groupDefaultBackend: "claude-v2",
+			}),
+		);
+
+		const config = loadAccessConfig(filePath);
+		expect(config.dmDefaultBackend).toBe("claude-v2");
+		expect(config.groupDefaultBackend).toBe("claude-v2");
+	});
 });
 
 describe("formatAdminNotification", () => {

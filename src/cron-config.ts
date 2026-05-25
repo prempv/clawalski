@@ -4,7 +4,7 @@ import type { Logger } from "./logger.js";
 
 const JOB_ID_RE = /^[a-z0-9][a-z0-9-]{0,27}$/;
 
-const backendIdSchema = z.enum(["claude", "codex"]);
+const backendIdSchema = z.enum(["claude", "claude-v2", "codex"]);
 
 const cronJobSchema = z
 	.object({
@@ -91,11 +91,11 @@ export function watchCronConfig(
 	filePath: string,
 	onChange: (config: CronConfig) => void,
 	log: Logger,
-): void {
+): () => void {
 	let debounce: ReturnType<typeof setTimeout> | null = null;
 
 	try {
-		watch(filePath, () => {
+		const watcher = watch(filePath, () => {
 			if (debounce) clearTimeout(debounce);
 			debounce = setTimeout(() => {
 				try {
@@ -108,8 +108,15 @@ export function watchCronConfig(
 			}, 300);
 		});
 		log.info({ filePath }, "watching cron config for changes");
+		return () => {
+			if (debounce) clearTimeout(debounce);
+			watcher.close();
+		};
 	} catch {
 		log.warn({ filePath }, "could not watch cron config file");
+		return () => {
+			if (debounce) clearTimeout(debounce);
+		};
 	}
 }
 

@@ -39,6 +39,14 @@ describe("session-store", () => {
 		});
 	});
 
+	it("stores claude-v2 sessions with the claude-v2 backend", () => {
+		store.setSession("tg:dm:102", "interactive-uuid", "claude-v2");
+		expect(store.getSession("tg:dm:102")).toEqual({
+			sessionId: "interactive-uuid",
+			backend: "claude-v2",
+		});
+	});
+
 	it("upserts existing session", () => {
 		store.setSession("tg:dm:100", "session-abc", "claude");
 		store.setSession("tg:dm:100", "session-xyz", "claude");

@@ -11,9 +11,10 @@ import type {
 	BackendBridgeOptions,
 	BackendId,
 	BackendRegistry,
+	BackendStreamEvent,
 	ConversationProcess,
 } from "./backend.js";
-import { isBackendId } from "./backend.js";
+import { BACKEND_IDS, isBackendId } from "./backend.js";
 import type { BindingConfig } from "./binding-config.js";
 import { resolveBinding } from "./binding-config.js";
 import { sendMessageWithAuthRetry } from "./claude-bridge.js";
@@ -30,11 +31,16 @@ import {
 	extractMessageContext,
 } from "./message-context.js";
 import { buildSystemPrompt } from "./prompt-builder.js";
+import { redactedPreview } from "./redaction.js";
 import { RequestTimer } from "./request-timer.js";
 import type { SessionRecorder } from "./session-stats/index.js";
 import type { SessionStore } from "./session-store.js";
 import { formatStatsMessage } from "./stats-format.js";
-import { type StreamingContext, streamToTelegram } from "./streaming.js";
+import {
+	type StreamTurnResult,
+	type StreamingContext,
+	streamToTelegram,
+} from "./streaming.js";
 import type { TelegramClient } from "./telegram-client.js";
 import type {
 	ContentBlock,
@@ -80,6 +86,54 @@ function pickBackend(
 	return opts.backends.defaultId;
 }
 
+function isClaudeBackend(backendId: BackendId): boolean {
+	return backendId === "claude" || backendId === "claude-v2";
+}
+
+async function* sendMessageDirect(
+	proc: ConversationProcess,
+	content: ContentBlock[],
+	timer?: RequestTimer,
+): AsyncGenerator<BackendStreamEvent> {
+	proc.sendInput(content, timer);
+	yield* proc.stream();
+}
+
+function firstTurnEvents(
+	backendId: BackendId,
+	proc: ConversationProcess,
+	pool: ReturnType<BackendRegistry["pool"]>,
+	conversationId: string,
+	resumeSessionId: string | null,
+	overrides: Partial<BackendBridgeOptions>,
+	content: ContentBlock[],
+	timer: RequestTimer,
+	log: Logger,
+): AsyncIterable<BackendStreamEvent> {
+	if (backendId === "claude-v2") {
+		return sendMessageDirect(proc, content, timer);
+	}
+	return sendMessageWithAuthRetry(
+		proc,
+		() => pool.getOrCreate(conversationId, resumeSessionId, timer, overrides),
+		() => pool.remove(conversationId),
+		content,
+		timer,
+		log,
+	);
+}
+
+function persistSessionId(
+	opts: HandleUpdateOptions,
+	conversationId: string,
+	sessionId: string | null | undefined,
+	backendId: BackendId,
+): void {
+	if (!sessionId) return;
+	opts.sessionStore.setSession(conversationId, sessionId, backendId);
+	opts.pendingBackends.clear(conversationId);
+}
+
 // ---------------------------------------------------------------------------
 // Per-conversation session state
 //
@@ -108,6 +162,16 @@ interface ClaudeSession {
 	/** True while a sendInput's content blocks are being built/dispatched.
 	 * Prevents the onQuiescent drain from racing with an in-flight submit. */
 	submitInFlight: boolean;
+	activeTurn: ActiveTurnInput | null;
+}
+
+interface ActiveTurnInput {
+	startedAt: number;
+	input: string;
+	inputDescription: string;
+	sender: { id: number | null; name: string; username: string | null };
+	messageId: number;
+	textPreview: string;
 }
 
 const sessions = new Map<string, ClaudeSession>();
@@ -138,7 +202,7 @@ function pendingItemLogFields(item: PendingItem): Record<string, unknown> {
 		kind: item.kind,
 		messageId: firstMsg.message_id,
 		textLen: text?.length ?? 0,
-		textPreview: text?.slice(0, 200) ?? "[media]",
+		textPreview: text ? redactedPreview(text) : "[media]",
 		...(item.kind === "group" && { groupSize: item.messages.length }),
 	};
 }
@@ -381,10 +445,15 @@ async function dispatchPendingItem(
 						sessionId: session.proc.sessionId,
 						blocks: content.length,
 						textLen: text.length,
-						textPreview: text.slice(0, 200),
+						textPreview: redactedPreview(text),
 						kind: "single",
 					},
 					"dispatching to backend CLI",
+				);
+				session.activeTurn = activeTurnFromMessage(
+					extractMessageContext(item.message),
+					item.message,
+					text,
 				);
 				session.proc.sendInput(content);
 			}
@@ -392,6 +461,7 @@ async function dispatchPendingItem(
 			const content = await buildGroupContent(client, item.messages, log, opts);
 			if (content && content.length > 0) {
 				const text = describeContentBlocks(content);
+				const first = item.messages[0] as TelegramMessage;
 				opts.sessionRecorder.recordUserInput(session.conversationId, text);
 				log.info(
 					{
@@ -400,10 +470,15 @@ async function dispatchPendingItem(
 						sessionId: session.proc.sessionId,
 						blocks: content.length,
 						textLen: text.length,
-						textPreview: text.slice(0, 200),
+						textPreview: redactedPreview(text),
 						kind: "group",
 					},
 					"dispatching to backend CLI",
+				);
+				session.activeTurn = activeTurnFromMessage(
+					extractMessageContext(first),
+					first,
+					text,
 				);
 				session.proc.sendInput(content);
 			}
@@ -420,6 +495,26 @@ function describeContentBlocks(blocks: ContentBlock[]): string {
 		else if (block.type === "image") parts.push("[image]");
 	}
 	return parts.join("\n").trim() || "[media]";
+}
+
+function activeTurnFromMessage(
+	ctx: MessageContext,
+	message: TelegramMessage,
+	input: string,
+	inputDescription = input,
+): ActiveTurnInput {
+	return {
+		startedAt: Date.now(),
+		input,
+		inputDescription,
+		sender: {
+			id: ctx.senderId,
+			name: ctx.senderName,
+			username: ctx.senderUsername,
+		},
+		messageId: message.message_id,
+		textPreview: redactedPreview(input),
+	};
 }
 
 /**
@@ -481,7 +576,7 @@ async function startSession(
 
 	t.mark("claude_invoke");
 
-	if (backendId === "claude") {
+	if (isClaudeBackend(backendId)) {
 		try {
 			await ensureFreshCliToken(log);
 		} catch (err) {
@@ -490,6 +585,9 @@ async function startSession(
 	}
 
 	const overrides = buildProcessOverrides(opts, ctx);
+	const resumeSessionId = opts.pendingBackends.get(ctx.conversationId)
+		? null
+		: (existingSession?.sessionId ?? null);
 
 	// Spawn synchronously up front so we own a proc reference before the
 	// forwarder starts consuming events. Earlier versions deferred the spawn
@@ -498,10 +596,11 @@ async function startSession(
 	// own setup awaited before pulling its first event.
 	const proc = pool.getOrCreate(
 		ctx.conversationId,
-		existingSession?.sessionId ?? null,
+		resumeSessionId,
 		t,
 		overrides,
 	);
+	persistSessionId(opts, ctx.conversationId, proc.sessionId, backendId);
 
 	opts.sessionRecorder.start({
 		conversationId: ctx.conversationId,
@@ -516,29 +615,28 @@ async function startSession(
 			sessionId: existingSession?.sessionId ?? null,
 			blocks: content.length,
 			textLen: dispatchText.length,
-			textPreview: dispatchText.slice(0, 200),
+			textPreview: redactedPreview(dispatchText),
 			kind: "single",
 			firstTurn: true,
 		},
 		"dispatching to backend CLI",
 	);
 
-	const events = sendMessageWithAuthRetry(
+	const events = firstTurnEvents(
+		backendId,
 		proc,
-		() =>
-			pool.getOrCreate(
-				ctx.conversationId,
-				existingSession?.sessionId ?? null,
-				t,
-				overrides,
-			),
-		() => pool.remove(ctx.conversationId),
+		pool,
+		ctx.conversationId,
+		resumeSessionId,
+		overrides,
 		content,
 		t,
 		log,
 	);
 
 	const streamingContext: StreamingContext = {
+		conversationId: ctx.conversationId,
+		backend: backendId,
 		chatId: ctx.chatId,
 		messageThreadId: message.message_thread_id,
 		replyToMessageId: message.message_id,
@@ -555,6 +653,12 @@ async function startSession(
 		pending: [],
 		submitInFlight: false,
 		unsubscribeQuiescent: () => {},
+		activeTurn: activeTurnFromMessage(
+			ctx,
+			message,
+			dispatchText,
+			inputDescription,
+		),
 	};
 	sessions.set(ctx.conversationId, session);
 
@@ -567,7 +671,24 @@ async function startSession(
 		events,
 		log,
 		t,
-		(event) => opts.sessionRecorder.recordEvent(ctx.conversationId, event),
+		(event) => {
+			opts.sessionRecorder.recordEvent(ctx.conversationId, event);
+			if (event.type === "turn_complete") {
+				const owned = sessions.get(ctx.conversationId);
+				if (owned === session) {
+					persistSessionId(
+						opts,
+						ctx.conversationId,
+						event.sessionId,
+						backendId,
+					);
+				}
+			}
+		},
+		backendId === "claude-v2"
+			? (turn) =>
+					handleSessionTurnComplete(ctx, session, turn, backendId, opts, log)
+			: undefined,
 	)
 		.then((result) => {
 			t.mark("done");
@@ -654,6 +775,68 @@ async function drainPending(
 	await dispatchPendingItem(client, session, next, log, opts);
 }
 
+function handleSessionTurnComplete(
+	ctx: MessageContext,
+	session: ClaudeSession,
+	turn: StreamTurnResult,
+	backendId: BackendId,
+	opts: HandleUpdateOptions,
+	log: Logger,
+): void {
+	const sessionId = turn.sessionId ?? session.proc.sessionId;
+	if (sessionId) {
+		opts.sessionStore.setSession(ctx.conversationId, sessionId, backendId);
+		opts.pendingBackends.clear(ctx.conversationId);
+	}
+
+	const input = session.activeTurn;
+	const durationMs = input ? Date.now() - input.startedAt : 0;
+	if (sessionId) {
+		opts.conversationLogger.log({
+			timestamp: new Date().toISOString(),
+			conversationId: ctx.conversationId,
+			sessionId,
+			sender: input?.sender ?? {
+				id: ctx.senderId,
+				name: ctx.senderName,
+				username: ctx.senderUsername,
+			},
+			input: input?.inputDescription ?? "[unknown input]",
+			output: turn.responseText,
+			tools: turn.toolHistory,
+			durationMs,
+			error: turn.error ?? (turn.interrupted ? "stream interrupted" : null),
+			timings: {
+				turn_duration_ms: durationMs,
+			},
+		});
+	}
+
+	log.info(
+		{
+			conversationId: ctx.conversationId,
+			backend: backendId,
+			sessionId,
+			turnIndex: turn.turnIndex,
+			durationMs,
+			inputMessageId: input?.messageId,
+			inputPreview: input?.textPreview,
+			responseLen: turn.responseText.length,
+			responsePreview: redactedPreview(turn.responseText),
+			toolCount: turn.toolHistory.length,
+			telegramMessageIds: turn.delivery.messageIds,
+			telegramFailedChunks: turn.delivery.failedChunks,
+			inputTokens: turn.inputTokens,
+			outputTokens: turn.outputTokens,
+			error: turn.error,
+			interrupted: turn.interrupted,
+		},
+		"claude turn complete",
+	);
+
+	session.activeTurn = null;
+}
+
 /**
  * Persist session metadata + log to disk after a turn finishes. Wired
  * onto the long-running forwarder's resolution; runs once when the
@@ -676,6 +859,21 @@ function handleSessionResult(
 ): void {
 	const sessionId = result.sessionId;
 	if (!sessionId) return;
+
+	if (backendId === "claude-v2") {
+		log.info(
+			{
+				conversationId: ctx.conversationId,
+				sessionId,
+				responseLen: result.responseText.length,
+				toolCount: result.toolHistory.length,
+				error:
+					result.error ?? (result.interrupted ? "stream interrupted" : null),
+			},
+			"claude-v2 stream ended",
+		);
+		return;
+	}
 
 	opts.sessionStore.setSession(ctx.conversationId, sessionId, backendId);
 	opts.pendingBackends.clear(ctx.conversationId);
@@ -701,7 +899,7 @@ function handleSessionResult(
 			conversationId: ctx.conversationId,
 			timings: t.summary(),
 			tools: result.toolHistory.length,
-			triggeredBy: extractText(firstMessage)?.slice(0, 60) ?? "[media]",
+			triggeredBy: redactedPreview(extractText(firstMessage), 60) || "[media]",
 		},
 		"claude session ended",
 	);
@@ -834,18 +1032,19 @@ async function handleStatsCommand(
 }
 
 /**
- * Match `/new-claude`, `/new_claude`, `/new-codex`, or `/new_codex` (with
- * optional `@botname` suffix and trailing whitespace). Telegram's BotFather
- * menu only allows `[a-z0-9_]` so the registered commands use underscores;
- * we accept hyphens too because it's natural to type. No bare `/new` —
- * explicit commands only, since argument parsing was a regular source of
- * confusion ("did the bot read codex or did it default?").
+ * Match `/new-claude`, `/new-claude-v2`, `/new-claudev2`, `/new-codex` and underscore
+ * variants (with optional `@botname` suffix and trailing whitespace).
+ * Telegram's BotFather menu only allows `[a-z0-9_]` so the registered
+ * commands use underscores; we accept hyphens too because it's natural to
+ * type. No bare `/new` — explicit commands only, since argument parsing was
+ * a regular source of confusion ("did the bot read codex or did it default?").
  */
 function matchNewBackendCommand(text: string | null): BackendId | null {
 	if (!text) return null;
-	const m = text.match(/^\/new[-_](claude|codex)(@\S+)?(\s|$)/i);
+	const m = text.match(/^\/new[-_](claude(?:[-_]?v2)?|codex)(@\S+)?(\s|$)/i);
 	if (!m) return null;
-	const backend = m[1]?.toLowerCase();
+	const raw = m[1]?.toLowerCase();
+	const backend = raw?.replace(/^claude[-_]?v2$/, "claude-v2");
 	return isBackendId(backend ?? "") ? (backend as BackendId) : null;
 }
 
@@ -866,7 +1065,7 @@ async function handleNewBackendCommand(
 	};
 
 	// Tear down whichever backend's pool currently holds this conversation.
-	for (const id of ["claude", "codex"] as const) {
+	for (const id of BACKEND_IDS) {
 		opts.backends.pool(id).remove(conversationId);
 	}
 	opts.sessionStore.deleteSession(conversationId);
@@ -1022,7 +1221,7 @@ async function startSessionFromGroup(
 
 	t.mark("claude_invoke");
 
-	if (backendId === "claude") {
+	if (isClaudeBackend(backendId)) {
 		try {
 			await ensureFreshCliToken(log);
 		} catch (err) {
@@ -1031,13 +1230,17 @@ async function startSessionFromGroup(
 	}
 
 	const overrides = buildProcessOverrides(opts, ctx);
+	const resumeSessionId = opts.pendingBackends.get(ctx.conversationId)
+		? null
+		: (existingSession?.sessionId ?? null);
 
 	const proc = pool.getOrCreate(
 		ctx.conversationId,
-		existingSession?.sessionId ?? null,
+		resumeSessionId,
 		t,
 		overrides,
 	);
+	persistSessionId(opts, ctx.conversationId, proc.sessionId, backendId);
 
 	opts.sessionRecorder.start({
 		conversationId: ctx.conversationId,
@@ -1052,29 +1255,28 @@ async function startSessionFromGroup(
 			sessionId: existingSession?.sessionId ?? null,
 			blocks: content.length,
 			textLen: dispatchText.length,
-			textPreview: dispatchText.slice(0, 200),
+			textPreview: redactedPreview(dispatchText),
 			kind: "group",
 			firstTurn: true,
 		},
 		"dispatching to backend CLI",
 	);
 
-	const events = sendMessageWithAuthRetry(
+	const events = firstTurnEvents(
+		backendId,
 		proc,
-		() =>
-			pool.getOrCreate(
-				ctx.conversationId,
-				existingSession?.sessionId ?? null,
-				t,
-				overrides,
-			),
-		() => pool.remove(ctx.conversationId),
+		pool,
+		ctx.conversationId,
+		resumeSessionId,
+		overrides,
 		content,
 		t,
 		log,
 	);
 
 	const streamingContext: StreamingContext = {
+		conversationId: ctx.conversationId,
+		backend: backendId,
 		chatId: ctx.chatId,
 		messageThreadId: first.message_thread_id,
 		replyToMessageId: first.message_id,
@@ -1089,6 +1291,12 @@ async function startSessionFromGroup(
 		pending: [],
 		submitInFlight: false,
 		unsubscribeQuiescent: () => {},
+		activeTurn: activeTurnFromMessage(
+			ctx,
+			first,
+			dispatchText,
+			inputDescription,
+		),
 	};
 	sessions.set(ctx.conversationId, session);
 
@@ -1098,7 +1306,24 @@ async function startSessionFromGroup(
 		events,
 		log,
 		t,
-		(event) => opts.sessionRecorder.recordEvent(ctx.conversationId, event),
+		(event) => {
+			opts.sessionRecorder.recordEvent(ctx.conversationId, event);
+			if (event.type === "turn_complete") {
+				const owned = sessions.get(ctx.conversationId);
+				if (owned === session) {
+					persistSessionId(
+						opts,
+						ctx.conversationId,
+						event.sessionId,
+						backendId,
+					);
+				}
+			}
+		},
+		backendId === "claude-v2"
+			? (turn) =>
+					handleSessionTurnComplete(ctx, session, turn, backendId, opts, log)
+			: undefined,
 	)
 		.then((result) => {
 			t.mark("done");

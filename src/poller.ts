@@ -1,6 +1,7 @@
 import type { HandleUpdateOptions } from "./claude-handler.js";
 import { handleUpdate } from "./claude-handler.js";
 import type { Logger } from "./logger.js";
+import { redactedPreview } from "./redaction.js";
 import { RequestTimer } from "./request-timer.js";
 import type { TelegramClient } from "./telegram-client.js";
 import type { TelegramUpdate } from "./types.js";
@@ -33,7 +34,7 @@ function summarizeUpdate(update: TelegramUpdate): Record<string, unknown> {
 		hasDocument: !!msg.document,
 		hasMediaGroup: !!msg.media_group_id,
 		textLen: text?.length ?? 0,
-		textPreview: text ? text.slice(0, TEXT_PREVIEW_MAX) : null,
+		textPreview: text ? redactedPreview(text, TEXT_PREVIEW_MAX) : null,
 		replyToMessageId: msg.reply_to_message?.message_id,
 	};
 }
@@ -51,7 +52,7 @@ export async function startPolling(
 
 	while (!signal.aborted) {
 		try {
-			const updates = await client.getUpdates(offset, 30);
+			const updates = await client.getUpdates(offset, 30, signal);
 
 			for (const update of updates) {
 				offset = update.update_id + 1;

@@ -49,6 +49,12 @@ describe("loadConfig", () => {
 		expect(config.webhookPath).toBe("/telegram-webhook");
 	});
 
+	it("accepts claude-v2 as the default backend", () => {
+		vi.stubEnv("DEFAULT_BACKEND", "claude-v2");
+		const config = loadConfig({ instancePath: INSTANCE });
+		expect(config.defaultBackend).toBe("claude-v2");
+	});
+
 	it("throws on missing token", () => {
 		vi.stubEnv("TELEGRAM_BOT_TOKEN", "");
 		expect(() => loadConfig({ instancePath: INSTANCE })).toThrow(ConfigError);

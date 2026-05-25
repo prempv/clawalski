@@ -53,10 +53,14 @@ export class TelegramClient {
 		return this.call<TelegramUser>("getMe");
 	}
 
-	async getUpdates(offset?: number, timeout = 30): Promise<TelegramUpdate[]> {
+	async getUpdates(
+		offset?: number,
+		timeout = 30,
+		signal?: AbortSignal,
+	): Promise<TelegramUpdate[]> {
 		const params: Record<string, string> = { timeout: String(timeout) };
 		if (offset !== undefined) params.offset = String(offset);
-		return this.call<TelegramUpdate[]>("getUpdates", params);
+		return this.call<TelegramUpdate[]>("getUpdates", params, { signal });
 	}
 
 	async sendMessage(params: SendMessageParams): Promise<TelegramMessage> {
@@ -128,6 +132,7 @@ export class TelegramClient {
 	private async call<T>(
 		method: string,
 		body?: Record<string, unknown>,
+		opts: { signal?: AbortSignal } = {},
 	): Promise<T> {
 		let rateLimitAttempt = 0;
 		let networkAttempt = 0;
@@ -139,8 +144,10 @@ export class TelegramClient {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: body ? JSON.stringify(body) : undefined,
+					signal: opts.signal,
 				});
 			} catch (err) {
+				if (opts.signal?.aborted) throw err;
 				if (networkAttempt >= NETWORK_RETRY_COUNT) throw err;
 				const delay = NETWORK_RETRY_DELAY_MS * 2 ** networkAttempt;
 				networkAttempt += 1;

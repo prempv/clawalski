@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { stdin, stdout } from "node:process";
 import * as readline from "node:readline/promises";
@@ -10,7 +10,7 @@ import Database from "better-sqlite3";
 import { z } from "zod";
 import { createInterface } from "node:readline";
 import { Translator, parseLine } from "claude-code-parser";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { Cron } from "croner";
 import { performance } from "node:perf_hooks";
@@ -194,7 +194,11 @@ async function listCommand(_argv) {
 }
 //#endregion
 //#region src/access.ts
-const backendIdSchema$2 = z.enum(["claude", "codex"]);
+const backendIdSchema$2 = z.enum([
+	"claude",
+	"claude-v2",
+	"codex"
+]);
 const accessFileSchema = z.object({
 	dmPolicy: z.enum(["open", "allowlist"]).default("open"),
 	groupPolicy: z.enum(["open", "allowlist"]).default("open"),
@@ -252,7 +256,7 @@ function loadAccessConfig(filePath, log) {
 function watchAccessConfig(filePath, onChange, log) {
 	let debounce = null;
 	try {
-		watch(filePath, () => {
+		const watcher = watch(filePath, () => {
 			if (debounce) clearTimeout(debounce);
 			debounce = setTimeout(() => {
 				try {
@@ -264,8 +268,15 @@ function watchAccessConfig(filePath, onChange, log) {
 			}, 300);
 		});
 		log.info({ filePath }, "watching access config for changes");
+		return () => {
+			if (debounce) clearTimeout(debounce);
+			watcher.close();
+		};
 	} catch {
 		log.warn({ filePath }, "could not watch access config file");
+		return () => {
+			if (debounce) clearTimeout(debounce);
+		};
 	}
 }
 function isAllowed(ctx, access) {
@@ -315,6 +326,9 @@ function shouldNotifyAdmin(ctx) {
 //#endregion
 //#region src/backend-registry.ts
 var DefaultBackendRegistry = class {
+	defaultId;
+	pools;
+	cronPools;
 	constructor(defaultId, pools, cronPools) {
 		this.defaultId = defaultId;
 		this.pools = pools;
@@ -411,7 +425,11 @@ function resolveBinding(ctx, config) {
 }
 //#endregion
 //#region src/backend.ts
-const BACKEND_IDS = ["claude", "codex"];
+const BACKEND_IDS = [
+	"claude",
+	"claude-v2",
+	"codex"
+];
 function isBackendId(value) {
 	return BACKEND_IDS.includes(value);
 }
@@ -436,7 +454,7 @@ function summarizeToolInput(toolName, input) {
 }
 //#endregion
 //#region src/claude-bridge.ts
-const DEFAULT_SYSTEM_PROMPT = "You are responding via a Telegram bot. Be concise and direct. Do not quote the user's message back to them. Do not use markdown headers. Keep responses short unless the task requires detail.";
+const DEFAULT_SYSTEM_PROMPT$1 = "You are responding via a Telegram bot. Be concise and direct. Do not quote the user's message back to them. Do not use markdown headers. Keep responses short unless the task requires detail.";
 var EventQueue$1 = class {
 	buffer = [];
 	waiting = null;
@@ -508,7 +526,7 @@ var ClaudeProcess = class {
 		];
 		if (resumeSessionId) args.push("--resume", resumeSessionId);
 		if (opts.model) args.push("--model", opts.model);
-		const systemPrompt = opts.systemPrompt !== void 0 ? opts.systemPrompt : DEFAULT_SYSTEM_PROMPT;
+		const systemPrompt = opts.systemPrompt !== void 0 ? opts.systemPrompt : DEFAULT_SYSTEM_PROMPT$1;
 		if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
 		const settings = JSON.stringify({ permissions: { allow: [
 			"Bash",
@@ -529,7 +547,7 @@ var ClaudeProcess = class {
 			PATH: sandboxPath
 		}).filter(([, v]) => v !== void 0).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
 		if (opts.conversationHistoryDir) mkdirSync(opts.conversationHistoryDir, { recursive: true });
-		this.proc = spawn("landrun", [
+		const landrunArgs = [
 			"--rox",
 			"/",
 			"--rw",
@@ -547,7 +565,8 @@ var ClaudeProcess = class {
 			"--",
 			"claude",
 			...args
-		], {
+		];
+		this.proc = spawn("landrun", landrunArgs, {
 			cwd: opts.workingDir,
 			stdio: [
 				"pipe",
@@ -675,7 +694,7 @@ var ProcessPool = class {
 		}
 		if (existing) this.processes.delete(conversationId);
 		timer?.mark("process_spawned");
-		const proc = new ClaudeProcess(overrides ? mergeOpts$1(this.opts, overrides) : this.opts, resumeSessionId);
+		const proc = new ClaudeProcess(overrides ? mergeOpts$2(this.opts, overrides) : this.opts, resumeSessionId);
 		this.processes.set(conversationId, proc);
 		return proc;
 	}
@@ -830,10 +849,911 @@ var StreamEventParser = class {
 		}
 	}
 };
+function mergeOpts$2(base, overrides) {
+	const result = { ...base };
+	for (const [key, value] of Object.entries(overrides)) if (value !== void 0) result[key] = value;
+	return result;
+}
+//#endregion
+//#region src/redaction.ts
+const SECRET_VALUE = "[REDACTED]";
+const BROWSERBASE_PREFIX = [
+	"bb",
+	"live",
+	""
+].join("_");
+const TOKEN_PATTERNS = [
+	new RegExp(`\\b${BROWSERBASE_PREFIX}[A-Za-z0-9_-]{16,}\\b`, "g"),
+	/\bsk-[A-Za-z0-9_-]{16,}\b/g,
+	/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g,
+	/\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g,
+	/\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b/g
+];
+const LABELLED_SECRET_PATTERN = /\b((?:api[_\s-]?key|project[_\s-]?key|secret|access[_\s-]?token|refresh[_\s-]?token|auth[_\s-]?token|bearer|password|token)\s*[:=]\s*)([^\s'",;]{12,})/gi;
+function redactSensitiveText(text) {
+	let redacted = text.replace(LABELLED_SECRET_PATTERN, (_match, prefix) => `${prefix}${SECRET_VALUE}`);
+	for (const pattern of TOKEN_PATTERNS) redacted = redacted.replace(pattern, SECRET_VALUE);
+	return redacted;
+}
+function redactedPreview(text, limit = 200) {
+	if (!text) return "";
+	return redactSensitiveText(text).slice(0, limit);
+}
+//#endregion
+//#region src/claude-interactive-bridge.ts
+const DEFAULT_SYSTEM_PROMPT = "You are responding via a Telegram bot. Be concise and direct. Do not quote the user's message back to them. Do not use markdown headers. Keep responses short unless the task requires detail.";
+const POLL_INTERVAL_MS = 500;
+const PROMPT_ACK_TIMEOUT_MS = 2e4;
+const LAUNCH_READY_TIMEOUT_MS = 3e4;
+const ALIVE_CHECK_INTERVAL_MS = 5e3;
+const ENTER_AFTER_PASTE_DELAY_MS = 150;
+const CLEAR_INPUT_DELAY_MS = 50;
+function translateTranscriptRecord(raw) {
+	const msg = raw.message;
+	const events = [];
+	if (raw.type === "assistant" && msg?.role === "assistant") {
+		const blocks = Array.isArray(msg.content) ? msg.content : typeof msg.content === "string" ? [{
+			type: "text",
+			text: msg.content
+		}] : [];
+		for (const block of blocks) if (block.type === "text" && block.text) events.push({
+			type: "text_delta",
+			content: block.text
+		});
+		else if (block.type === "thinking" && block.thinking) events.push({
+			type: "thinking_delta",
+			content: block.thinking
+		});
+		else if (block.type === "tool_use") events.push({
+			type: "tool_use",
+			toolUseId: block.id ?? "",
+			toolName: block.name ?? "unknown",
+			input: stringifyToolInput(block.input)
+		});
+	}
+	if (raw.type === "user" && msg?.role === "user") {
+		const blocks = Array.isArray(msg.content) ? msg.content : [];
+		for (const block of blocks) if (block.type === "tool_result") events.push({
+			type: "tool_result",
+			toolUseId: block.tool_use_id ?? "",
+			output: summarizeToolResult(block.content),
+			isError: block.is_error === true
+		});
+	}
+	return events;
+}
+function isIdlePromptNotification(payload) {
+	if (!payload) return false;
+	if (payload.notification_type === "idle_prompt") return true;
+	return /waiting for your input/i.test(String(payload.message ?? ""));
+}
+var ClaudeInteractiveProcess = class {
+	opts;
+	stateDir;
+	uploadDir;
+	tmuxSession;
+	tmuxTarget;
+	hookScriptPath;
+	hookSettingsPath;
+	hookLogPath;
+	launcherPath;
+	log;
+	events = new EventQueue$1();
+	seenTranscriptUuids = /* @__PURE__ */ new Set();
+	quiescentListeners = /* @__PURE__ */ new Set();
+	ready;
+	_sessionId;
+	_alive = true;
+	active = false;
+	openToolCalls = /* @__PURE__ */ new Set();
+	transcriptPath = null;
+	transcriptOffset = 0;
+	hookOffset = 0;
+	pollTimer = null;
+	polling = false;
+	lastAliveCheck = 0;
+	turnTimer = null;
+	firstEventMarked = false;
+	promptAckTimer = null;
+	awaitingPromptAck = false;
+	trustPromptAttempts = 0;
+	turnUsage = {
+		inputTokens: 0,
+		outputTokens: 0
+	};
+	model = null;
+	constructor(opts, resumeSessionId) {
+		this.opts = opts;
+		this._sessionId = resumeSessionId ?? randomUUID();
+		const baseStateDir = opts.stateDir ?? join(tmpdir(), "clawalski-claude-v2");
+		this.stateDir = join(baseStateDir, safeName(opts.workingDir, this._sessionId));
+		this.uploadDir = join(this.stateDir, "uploads");
+		this.tmuxSession = `clawalski-v2-${hashForName(`${opts.workingDir}:${this._sessionId}`).slice(0, 18)}`;
+		this.tmuxTarget = `${this.tmuxSession}:0.0`;
+		this.hookScriptPath = join(this.stateDir, "hook-capture.cjs");
+		this.hookSettingsPath = join(this.stateDir, "claude-hooks-settings.json");
+		this.hookLogPath = join(this.stateDir, "hooks.jsonl");
+		this.launcherPath = join(this.stateDir, "launch-claude.sh");
+		this.log = opts.log?.child({
+			component: "claude-v2",
+			tmuxSession: this.tmuxSession
+		});
+		mkdirSync(this.uploadDir, { recursive: true });
+		this.writeRuntimeFiles();
+		this.hookOffset = fileSize(this.hookLogPath);
+		this.startPoller();
+		this.log?.info({
+			stateDir: this.stateDir,
+			hookLogPath: this.hookLogPath,
+			resumeSessionId: resumeSessionId ?? null
+		}, "claude-v2 process initializing");
+		this.ready = this.launchOrReuse(resumeSessionId).catch((err) => {
+			this.publishTurnFailure(`Claude interactive launch failed: ${errMessage(err)}`);
+			this._alive = false;
+			this.events.end();
+			throw err;
+		});
+		this.ready.catch(() => {});
+	}
+	stream() {
+		return this.events;
+	}
+	sendInput(content, timer) {
+		if (!this._alive) return;
+		this.active = true;
+		this.turnTimer = timer ?? null;
+		this.firstEventMarked = false;
+		this.turnUsage = {
+			inputTokens: 0,
+			outputTokens: 0
+		};
+		this.inject(content, timer).catch((err) => {
+			this.clearPromptAckTimeout();
+			this.awaitingPromptAck = false;
+			this.publishTurnFailure(`Claude interactive input failed: ${errMessage(err)}`);
+		});
+	}
+	get quiescent() {
+		return !this.active && this._alive;
+	}
+	onQuiescent(cb) {
+		this.quiescentListeners.add(cb);
+		return () => {
+			this.quiescentListeners.delete(cb);
+		};
+	}
+	close() {
+		this.detach();
+	}
+	kill() {
+		this.detach();
+		runCommand$1("tmux", [
+			"kill-session",
+			"-t",
+			this.tmuxSession
+		]).catch(() => {});
+	}
+	get alive() {
+		return this._alive;
+	}
+	get sessionId() {
+		return this._sessionId;
+	}
+	async launchOrReuse(resumeSessionId) {
+		if (!await tmuxSessionExists(this.tmuxSession)) {
+			const claudeArgs = this.buildClaudeArgs(resumeSessionId);
+			this.writeLauncher(claudeArgs);
+			this.log?.info({
+				resumeSessionId: resumeSessionId ?? null,
+				workingDir: this.opts.workingDir
+			}, "claude-v2 tmux session launching");
+			await tmux([
+				"new-session",
+				"-d",
+				"-s",
+				this.tmuxSession,
+				"-c",
+				this.opts.workingDir,
+				"-x",
+				"120",
+				"-y",
+				"40",
+				shellQuote(this.launcherPath)
+			]);
+			await tmux([
+				"set-option",
+				"-t",
+				this.tmuxSession,
+				"remain-on-exit",
+				"on"
+			]);
+			await tmux([
+				"set-option",
+				"-t",
+				this.tmuxSession,
+				"history-limit",
+				"50000"
+			]);
+		} else this.log?.info({ resumeSessionId: resumeSessionId ?? null }, "claude-v2 tmux session reusing existing pane");
+		await this.waitReady();
+		this.log?.info({
+			sessionId: this._sessionId,
+			transcriptPath: this.transcriptPath
+		}, "claude-v2 process ready");
+	}
+	buildClaudeArgs(resumeSessionId) {
+		const args = ["--dangerously-skip-permissions"];
+		if (resumeSessionId) args.push("--resume", resumeSessionId);
+		else if (this._sessionId) args.push("--session-id", this._sessionId);
+		if (this.opts.model) args.push("--model", this.opts.model);
+		const systemPrompt = this.opts.systemPrompt !== void 0 ? this.opts.systemPrompt : DEFAULT_SYSTEM_PROMPT;
+		if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
+		args.push("--settings", this.hookSettingsPath);
+		return args;
+	}
+	writeRuntimeFiles() {
+		writeFileSync(this.hookScriptPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const event = process.argv[2] || "unknown";
+const logPath = process.argv[3];
+let stdin = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { stdin += chunk; });
+process.stdin.on("end", () => {
+  let payload = null;
+  try { payload = stdin.trim() ? JSON.parse(stdin) : null; } catch { payload = { raw: stdin }; }
+  try {
+    fs.appendFileSync(logPath, JSON.stringify({
+      ts: new Date().toISOString(),
+      event,
+      session: process.env.CLAUDE_SESSION_ID || null,
+      cwd: process.cwd(),
+      payload,
+    }) + "\\n");
+  } catch {}
+});
+process.stdin.resume();
+`, { mode: 493 });
+		const hookEntry = (event) => [{
+			matcher: "",
+			hooks: [{
+				type: "command",
+				command: `node ${JSON.stringify(this.hookScriptPath)} ${event} ${JSON.stringify(this.hookLogPath)}`,
+				timeout: 5
+			}]
+		}];
+		const settings = {
+			permissions: { allow: [
+				"Bash",
+				"Read",
+				"Edit",
+				"Write",
+				"Glob",
+				"Grep",
+				"WebSearch",
+				"WebFetch"
+			] },
+			hooks: {
+				SessionStart: hookEntry("SessionStart"),
+				UserPromptSubmit: hookEntry("UserPromptSubmit"),
+				PreToolUse: hookEntry("PreToolUse"),
+				PostToolUse: hookEntry("PostToolUse"),
+				Notification: hookEntry("Notification"),
+				Stop: hookEntry("Stop"),
+				StopFailure: hookEntry("StopFailure")
+			}
+		};
+		writeFileSync(this.hookSettingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+	}
+	writeLauncher(claudeArgs) {
+		const homeDir = process.env.HOME ?? homedir();
+		const nodeBinDir = dirname(process.execPath);
+		const sandboxPath = (process.env.PATH ?? "").split(":").includes(nodeBinDir) ? process.env.PATH : `${nodeBinDir}:${process.env.PATH ?? ""}`;
+		const env = {
+			...process.env,
+			PATH: sandboxPath
+		};
+		const envArgs = Object.entries(env).filter(([, v]) => v !== void 0).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
+		if (this.opts.conversationHistoryDir) mkdirSync(this.opts.conversationHistoryDir, { recursive: true });
+		const landrunArgs = [
+			"--rox",
+			"/",
+			"--rw",
+			this.opts.workingDir,
+			"--rw",
+			"/tmp",
+			"--rw",
+			this.stateDir,
+			"--rw",
+			`${homeDir}/.claude`,
+			...existsSync(`${homeDir}/.claude.json`) ? ["--rw", `${homeDir}/.claude.json`] : [],
+			"--rw",
+			"/dev/null",
+			...this.opts.conversationHistoryDir ? ["--rox", this.opts.conversationHistoryDir] : [],
+			...this.opts.cronFilePath ? ["--rw", this.opts.cronFilePath] : [],
+			"--unrestricted-network",
+			...envArgs,
+			"--",
+			"claude",
+			...claudeArgs
+		];
+		const script = [
+			"#!/usr/bin/env bash",
+			"set -euo pipefail",
+			`cd ${shellQuote(this.opts.workingDir)}`,
+			`exec landrun ${landrunArgs.map(shellQuote).join(" ")}`,
+			""
+		].join("\n");
+		writeFileSync(this.launcherPath, script, { mode: 493 });
+	}
+	async waitReady() {
+		const deadline = Date.now() + LAUNCH_READY_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			await this.pollOnce();
+			if (!await this.isTmuxAlive()) {
+				const pane = await this.capturePane().catch(() => "");
+				throw new Error(`tmux session exited before ready${pane ? `\n${pane}` : ""}`);
+			}
+			if (await this.maybeAcceptTrustPrompt()) {
+				await delay(POLL_INTERVAL_MS);
+				continue;
+			}
+			if (this.transcriptPath) {
+				if (await this.startupPromptsCleared()) {
+					this.transcriptOffset = fileSize(this.transcriptPath);
+					return;
+				}
+				continue;
+			}
+			if (this._sessionId) {
+				const path = findTranscriptPath(this._sessionId);
+				if (path) {
+					this.setTranscriptPath(path, true);
+					if (await this.startupPromptsCleared()) return;
+				}
+			}
+			await delay(POLL_INTERVAL_MS);
+		}
+		const pane = await this.capturePane().catch(() => "");
+		throw new Error(`Claude interactive session was not ready${pane ? `\n${pane}` : ""}`);
+	}
+	async startupPromptsCleared() {
+		await delay(2e3);
+		return !await this.maybeAcceptTrustPrompt();
+	}
+	async maybeAcceptTrustPrompt() {
+		if (!isTrustPrompt(await this.capturePane(40).catch(() => ""))) return false;
+		if (this.trustPromptAttempts < 6) {
+			this.trustPromptAttempts += 1;
+			await tmux([
+				"send-keys",
+				"-t",
+				this.tmuxTarget,
+				"Enter"
+			]);
+			await delay(700);
+		}
+		return true;
+	}
+	startPoller() {
+		this.pollTimer = setInterval(() => {
+			this.pollOnce().catch((err) => {
+				this.log?.warn({ err }, "claude-v2 poll failed");
+				this.events.push({
+					type: "error",
+					message: `Claude interactive watcher failed: ${errMessage(err)}`,
+					sessionId: this._sessionId ?? void 0
+				});
+			});
+		}, POLL_INTERVAL_MS);
+	}
+	async pollOnce() {
+		if (!this._alive || this.polling) return;
+		this.polling = true;
+		try {
+			await this.pollHooks();
+			await this.flushTranscript();
+			if (Date.now() - this.lastAliveCheck > ALIVE_CHECK_INTERVAL_MS) {
+				this.lastAliveCheck = Date.now();
+				if (!await this.isTmuxAlive() && this._alive) {
+					const pane = await this.capturePane().catch(() => "");
+					this.log?.error({
+						sessionId: this._sessionId,
+						panePreview: redactedPreview(pane)
+					}, "claude-v2 tmux session ended");
+					this._alive = false;
+					this.events.push({
+						type: "error",
+						message: `Claude interactive tmux session ended${pane ? `\n${pane}` : ""}`,
+						sessionId: this._sessionId ?? void 0
+					});
+					this.events.end();
+					this.quiescentListeners.clear();
+				}
+			}
+		} finally {
+			this.polling = false;
+		}
+	}
+	async pollHooks() {
+		if (!existsSync(this.hookLogPath)) return;
+		const size = fileSize(this.hookLogPath);
+		if (size < this.hookOffset) this.hookOffset = 0;
+		if (size === this.hookOffset) return;
+		const lines = await readLinesFrom(this.hookLogPath, this.hookOffset, size);
+		this.hookOffset = size;
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			let record;
+			try {
+				record = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			try {
+				await this.handleHook(record);
+			} catch (err) {
+				this.log?.warn({ err }, "claude-v2 hook handling failed");
+				this.events.push({
+					type: "error",
+					message: `Claude interactive hook handling failed: ${errMessage(err)}`,
+					sessionId: this._sessionId ?? void 0
+				});
+			}
+		}
+	}
+	async handleHook(record) {
+		const payload = record.payload ?? {};
+		const eventName = record.event ?? payload.hook_event_name;
+		if (payload.session_id) this._sessionId = payload.session_id;
+		if (payload.transcript_path) this.setTranscriptPath(payload.transcript_path, !this.active);
+		if (payload.model && payload.model !== this.model) {
+			this.model = payload.model;
+			this.publish({
+				type: "session_meta",
+				model: payload.model
+			});
+		}
+		if (eventName === "UserPromptSubmit") {
+			this.clearPromptAckTimeout();
+			this.awaitingPromptAck = false;
+			this.log?.info({
+				sessionId: this._sessionId,
+				transcriptPath: this.transcriptPath
+			}, "claude-v2 prompt acknowledged");
+			return;
+		}
+		if (eventName === "Stop") {
+			this.log?.info({
+				sessionId: this._sessionId,
+				transcriptPath: this.transcriptPath
+			}, "claude-v2 stop hook received");
+			await this.completeTurn();
+			return;
+		}
+		if (eventName === "Notification" && isIdlePromptNotification(payload)) {
+			this.log?.info({
+				sessionId: this._sessionId,
+				active: this.active,
+				awaitingPromptAck: this.awaitingPromptAck,
+				notificationType: payload.notification_type
+			}, "claude-v2 idle notification received");
+			if (this.active || this.awaitingPromptAck) await this.completeTurn();
+			return;
+		}
+		if (eventName === "StopFailure") {
+			this.clearPromptAckTimeout();
+			this.awaitingPromptAck = false;
+			await this.flushTranscript();
+			this.log?.warn({
+				sessionId: this._sessionId,
+				message: payload.message
+			}, "claude-v2 stop failure hook received");
+			this.publishTurnFailure(payload.message ? String(payload.message) : "Claude stop hook failed");
+		}
+	}
+	async completeTurn() {
+		this.clearPromptAckTimeout();
+		this.awaitingPromptAck = false;
+		await this.flushTranscript();
+		await delay(50);
+		await this.flushTranscript();
+		this.log?.info({
+			sessionId: this._sessionId,
+			inputTokens: this.turnUsage.inputTokens || null,
+			outputTokens: this.turnUsage.outputTokens || null,
+			transcriptPath: this.transcriptPath
+		}, "claude-v2 turn completion publishing");
+		this.publish({
+			type: "turn_complete",
+			sessionId: this._sessionId ?? void 0,
+			inputTokens: this.turnUsage.inputTokens > 0 ? this.turnUsage.inputTokens : void 0,
+			outputTokens: this.turnUsage.outputTokens > 0 ? this.turnUsage.outputTokens : void 0
+		});
+		this.turnUsage = {
+			inputTokens: 0,
+			outputTokens: 0
+		};
+	}
+	setTranscriptPath(path, skipExisting) {
+		if (this.transcriptPath === path) return;
+		this.transcriptPath = path;
+		this.transcriptOffset = skipExisting ? fileSize(path) : 0;
+	}
+	async flushTranscript() {
+		if (!this.transcriptPath || !existsSync(this.transcriptPath)) return;
+		const size = fileSize(this.transcriptPath);
+		if (size < this.transcriptOffset) {
+			this.transcriptOffset = 0;
+			this.seenTranscriptUuids.clear();
+		}
+		if (size === this.transcriptOffset) return;
+		const lines = await readLinesFrom(this.transcriptPath, this.transcriptOffset, size);
+		this.transcriptOffset = size;
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			let raw;
+			try {
+				raw = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (raw.sessionId) this._sessionId = raw.sessionId;
+			if (raw.uuid) {
+				if (this.seenTranscriptUuids.has(raw.uuid)) continue;
+				this.seenTranscriptUuids.add(raw.uuid);
+			}
+			this.accumulateUsage(raw);
+			const model = raw.message?.model;
+			if (model && model !== this.model) {
+				this.model = model;
+				this.publish({
+					type: "session_meta",
+					model
+				});
+			}
+			for (const event of translateTranscriptRecord(raw)) this.publish(event);
+		}
+	}
+	accumulateUsage(raw) {
+		if (raw.type !== "assistant") return;
+		const usage = raw.message?.usage;
+		if (!usage) return;
+		this.turnUsage.inputTokens += (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
+		this.turnUsage.outputTokens += usage.output_tokens ?? 0;
+	}
+	async inject(content, timer) {
+		await this.ready;
+		if (!await this.isTmuxAlive()) throw new Error(`tmux session missing: ${this.tmuxSession}`);
+		const prompt = renderInteractiveContent(content, this.uploadDir);
+		const bufferName = `${this.tmuxSession}-input`;
+		await tmux([
+			"send-keys",
+			"-t",
+			this.tmuxTarget,
+			"C-u"
+		]);
+		await delay(CLEAR_INPUT_DELAY_MS);
+		await tmux([
+			"load-buffer",
+			"-b",
+			bufferName,
+			"-"
+		], { input: prompt });
+		await tmux([
+			"paste-buffer",
+			"-d",
+			"-b",
+			bufferName,
+			"-t",
+			this.tmuxTarget
+		]);
+		await delay(ENTER_AFTER_PASTE_DELAY_MS);
+		await tmux([
+			"send-keys",
+			"-t",
+			this.tmuxTarget,
+			"Enter"
+		]);
+		this.awaitingPromptAck = true;
+		this.armPromptAckTimeout();
+		this.log?.info({
+			sessionId: this._sessionId,
+			promptLen: prompt.length,
+			promptPreview: redactedPreview(prompt),
+			enterDelayMs: ENTER_AFTER_PASTE_DELAY_MS
+		}, "claude-v2 prompt injected");
+		timer?.mark("message_sent");
+	}
+	publish(event) {
+		if (!this.firstEventMarked && (event.type === "session_meta" || event.type === "text_delta" || event.type === "thinking_delta" || event.type === "tool_use" || event.type === "tool_result" || event.type === "turn_complete" || event.type === "error")) {
+			this.firstEventMarked = true;
+			this.turnTimer?.mark("first_event");
+		}
+		if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "tool_use" || event.type === "tool_result") this.active = true;
+		if (event.type === "tool_use") this.openToolCalls.add(event.toolUseId);
+		else if (event.type === "tool_result") this.openToolCalls.delete(event.toolUseId);
+		this.events.push(event);
+		if (event.type === "turn_complete") {
+			if (event.sessionId) this._sessionId = event.sessionId;
+			this.openToolCalls.clear();
+			this.markQuiescent();
+		}
+	}
+	publishTurnFailure(message) {
+		this.events.push({
+			type: "error",
+			message,
+			sessionId: this._sessionId ?? void 0
+		});
+		this.publish({
+			type: "turn_complete",
+			sessionId: this._sessionId ?? void 0
+		});
+	}
+	markQuiescent() {
+		if (!this.active) return;
+		this.active = false;
+		this.log?.info({
+			sessionId: this._sessionId,
+			listeners: this.quiescentListeners.size
+		}, "claude-v2 session quiescent");
+		const snapshot = [...this.quiescentListeners];
+		for (const cb of snapshot) try {
+			cb();
+		} catch {}
+	}
+	armPromptAckTimeout() {
+		this.clearPromptAckTimeout();
+		this.promptAckTimer = setTimeout(() => {
+			if (!this.awaitingPromptAck) return;
+			this.awaitingPromptAck = false;
+			this.capturePane().catch(() => "").then((pane) => {
+				this.log?.warn({
+					sessionId: this._sessionId,
+					panePreview: redactedPreview(pane)
+				}, "claude-v2 prompt acknowledgement timeout");
+				this.publishTurnFailure(`Claude interactive did not acknowledge the pasted prompt within ${Math.round(PROMPT_ACK_TIMEOUT_MS / 1e3)}s${pane ? `\n\n${pane}` : ""}`);
+			});
+		}, PROMPT_ACK_TIMEOUT_MS);
+	}
+	clearPromptAckTimeout() {
+		if (this.promptAckTimer) {
+			clearTimeout(this.promptAckTimer);
+			this.promptAckTimer = null;
+		}
+	}
+	async isTmuxAlive() {
+		if (!await tmuxSessionExists(this.tmuxSession)) return false;
+		const result = await runCommand$1("tmux", [
+			"display-message",
+			"-p",
+			"-t",
+			this.tmuxTarget,
+			"#{pane_dead}"
+		]);
+		return result.code === 0 && result.stdout.trim() !== "1";
+	}
+	async capturePane(lines = 80) {
+		const result = await runCommand$1("tmux", [
+			"capture-pane",
+			"-t",
+			this.tmuxTarget,
+			"-p",
+			"-S",
+			`-${lines}`
+		]);
+		if (result.code !== 0) return "";
+		return result.stdout.trim();
+	}
+	detach() {
+		if (!this._alive) return;
+		this._alive = false;
+		this.log?.info({ sessionId: this._sessionId }, "claude-v2 process detached");
+		this.clearPromptAckTimeout();
+		if (this.pollTimer) {
+			clearInterval(this.pollTimer);
+			this.pollTimer = null;
+		}
+		this.events.end();
+		this.quiescentListeners.clear();
+	}
+};
+var ClaudeInteractiveProcessPool = class {
+	opts;
+	id = "claude-v2";
+	processes = /* @__PURE__ */ new Map();
+	constructor(opts) {
+		this.opts = opts;
+	}
+	getOrCreate(conversationId, resumeSessionId, timer, overrides) {
+		const existing = this.processes.get(conversationId);
+		if (existing?.alive) {
+			timer?.mark("process_reused");
+			return existing;
+		}
+		if (existing) this.processes.delete(conversationId);
+		timer?.mark("process_spawned");
+		const proc = new ClaudeInteractiveProcess(overrides ? mergeOpts$1(this.opts, overrides) : this.opts, resumeSessionId);
+		this.processes.set(conversationId, proc);
+		return proc;
+	}
+	remove(conversationId) {
+		const proc = this.processes.get(conversationId);
+		if (proc) {
+			proc.kill();
+			this.processes.delete(conversationId);
+		}
+	}
+	closeAll() {
+		for (const proc of this.processes.values()) proc.close();
+		this.processes.clear();
+	}
+};
+function renderInteractiveContent(content, uploadDir) {
+	const parts = [];
+	for (const block of content) if (block.type === "text") parts.push(block.text);
+	else if (block.type === "image") {
+		mkdirSync(uploadDir, { recursive: true });
+		const ext = block.source.media_type.includes("png") ? "png" : "jpg";
+		const filePath = join(uploadDir, `${randomUUID()}.${ext}`);
+		writeFileSync(filePath, Buffer.from(block.source.data, "base64"));
+		parts.push(`Attached image file: ${filePath}`);
+	}
+	return parts.join("\n\n").trim() || "Describe the attached file(s).";
+}
+function stringifyToolInput(input) {
+	try {
+		return JSON.stringify(input ?? {});
+	} catch {
+		return "{}";
+	}
+}
+function summarizeToolResult(content) {
+	if (typeof content === "string") return content.slice(0, 8e3);
+	if (Array.isArray(content)) return content.map((block) => {
+		if (typeof block === "string") return block;
+		if (block && typeof block === "object") {
+			const rec = block;
+			if (typeof rec.text === "string") return rec.text;
+			if (typeof rec.content === "string") return rec.content;
+			if (typeof rec.type === "string") return `[${rec.type}]`;
+		}
+		return "";
+	}).filter(Boolean).join("\n").slice(0, 8e3);
+	try {
+		return JSON.stringify(content ?? "").slice(0, 8e3);
+	} catch {
+		return String(content).slice(0, 8e3);
+	}
+}
 function mergeOpts$1(base, overrides) {
 	const result = { ...base };
 	for (const [key, value] of Object.entries(overrides)) if (value !== void 0) result[key] = value;
 	return result;
+}
+async function tmux(args, opts = {}) {
+	const result = await runCommand$1("tmux", args, opts);
+	if (result.code !== 0) throw new Error(`tmux ${args.join(" ")} failed (${result.code}): ${result.stderr || result.stdout}`);
+	return result;
+}
+async function tmuxSessionExists(sessionName) {
+	return (await runCommand$1("tmux", [
+		"has-session",
+		"-t",
+		sessionName
+	])).code === 0;
+}
+function runCommand$1(cmd, args, opts = {}) {
+	return new Promise((resolve, reject) => {
+		const child = spawn(cmd, args, { stdio: opts.input === void 0 ? [
+			"ignore",
+			"pipe",
+			"pipe"
+		] : "pipe" });
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		const timeout = opts.timeoutMs ? setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			child.kill("SIGTERM");
+			reject(/* @__PURE__ */ new Error(`${cmd} timed out after ${opts.timeoutMs}ms`));
+		}, opts.timeoutMs) : null;
+		child.stdout?.setEncoding("utf8");
+		child.stdout?.on("data", (chunk) => {
+			stdout += chunk;
+		});
+		child.stderr?.setEncoding("utf8");
+		child.stderr?.on("data", (chunk) => {
+			stderr += chunk;
+		});
+		child.on("error", (err) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			reject(err);
+		});
+		child.on("close", (code) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			resolve({
+				code,
+				stdout,
+				stderr
+			});
+		});
+		if (opts.input !== void 0) child.stdin?.end(opts.input);
+	});
+}
+async function readLinesFrom(filePath, start, endExclusive) {
+	const lines = [];
+	const rl = createInterface({
+		input: createReadStream(filePath, {
+			start,
+			end: Math.max(start, endExclusive - 1),
+			encoding: "utf8"
+		}),
+		crlfDelay: Number.POSITIVE_INFINITY
+	});
+	for await (const line of rl) lines.push(line);
+	return lines;
+}
+function findTranscriptPath(sessionId) {
+	const projects = join(homedir(), ".claude", "projects");
+	if (!existsSync(projects)) return null;
+	const stack = [projects];
+	const matches = [];
+	while (stack.length > 0) {
+		const dir = stack.pop();
+		if (!dir) continue;
+		let entries;
+		try {
+			entries = readdirSync(dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			const path = join(dir, entry.name);
+			if (entry.isDirectory()) stack.push(path);
+			else if (entry.isFile() && entry.name === `${sessionId}.jsonl`) matches.push(path);
+		}
+	}
+	matches.sort((a, b) => fileMtimeMs(b) - fileMtimeMs(a));
+	return matches[0] ?? null;
+}
+function safeName(workingDir, sessionId) {
+	return `${hashForName(workingDir).slice(0, 12)}-${sessionId}`;
+}
+function hashForName(value) {
+	return createHash("sha256").update(value).digest("hex");
+}
+function shellQuote(value) {
+	return `'${value.replace(/'/g, "'\\''")}'`;
+}
+function isTrustPrompt(text) {
+	return /quick safety check|do you trust|trust this folder/i.test(text) && /yes,\s*i trust/i.test(text);
+}
+function fileSize(path) {
+	try {
+		return statSync(path).size;
+	} catch {
+		return 0;
+	}
+}
+function fileMtimeMs(path) {
+	try {
+		return statSync(path).mtimeMs;
+	} catch {
+		return 0;
+	}
+}
+function errMessage(err) {
+	return err instanceof Error ? err.message : String(err);
+}
+function delay(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 //#endregion
 //#region src/codex-bridge.ts
@@ -1190,7 +2110,11 @@ function stripNulls$1(obj) {
 }
 //#endregion
 //#region src/config.ts
-const backendIdSchema$1 = z.enum(["claude", "codex"]);
+const backendIdSchema$1 = z.enum([
+	"claude",
+	"claude-v2",
+	"codex"
+]);
 const configSchema = z.object({
 	telegramBotToken: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
 	mode: z.enum(["polling", "webhook"]).default("polling"),
@@ -1292,8 +2216,17 @@ function createConversationLogger(logDir) {
 		return filepath;
 	}
 	return { log(entry) {
-		appendFileSync(resolveFile(entry.sessionId, entry.conversationId), `${JSON.stringify(entry)}\n`);
+		appendFileSync(resolveFile(entry.sessionId, entry.conversationId), `${JSON.stringify(redactEntry(entry))}\n`);
 	} };
+}
+function redactEntry(entry) {
+	return {
+		...entry,
+		input: redactSensitiveText(entry.input),
+		output: redactSensitiveText(entry.output),
+		tools: entry.tools.map(redactSensitiveText),
+		error: entry.error ? redactSensitiveText(entry.error) : null
+	};
 }
 /**
 * Migrate flat log files from the old layout into per-conversationId
@@ -1322,7 +2255,11 @@ function migrateConversationLogs(logDir) {
 //#endregion
 //#region src/cron-config.ts
 const JOB_ID_RE = /^[a-z0-9][a-z0-9-]{0,27}$/;
-const backendIdSchema = z.enum(["claude", "codex"]);
+const backendIdSchema = z.enum([
+	"claude",
+	"claude-v2",
+	"codex"
+]);
 const cronJobSchema = z.object({
 	id: z.string().regex(JOB_ID_RE, "must be lowercase alphanumeric + hyphens, 1-28 chars"),
 	name: z.string().regex(JOB_ID_RE, "must be lowercase alphanumeric + hyphens, 1-28 chars"),
@@ -1369,7 +2306,7 @@ function loadCronConfig(filePath, log) {
 function watchCronConfig(filePath, onChange, log) {
 	let debounce = null;
 	try {
-		watch(filePath, () => {
+		const watcher = watch(filePath, () => {
 			if (debounce) clearTimeout(debounce);
 			debounce = setTimeout(() => {
 				try {
@@ -1381,8 +2318,15 @@ function watchCronConfig(filePath, onChange, log) {
 			}, 300);
 		});
 		log.info({ filePath }, "watching cron config for changes");
+		return () => {
+			if (debounce) clearTimeout(debounce);
+			watcher.close();
+		};
 	} catch {
 		log.warn({ filePath }, "could not watch cron config file");
+		return () => {
+			if (debounce) clearTimeout(debounce);
+		};
 	}
 }
 /** Convert job name to Telegram command name: hyphens → underscores, prefixed with run_ */
@@ -1772,8 +2716,10 @@ const EDIT_INTERVAL_MS = 1500;
 const TYPING_INTERVAL_MS = 4e3;
 const MAX_MESSAGE_LENGTH = 4096;
 const STREAM_INTERRUPTED_MARKER = "[Stream interrupted — the Claude CLI run ended before completion]";
-async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
+async function streamToTelegram(client, ctx, events, log, timer, onEvent, onTurnComplete) {
 	log.info({
+		conversationId: ctx.conversationId,
+		backend: ctx.backend,
 		chatId: ctx.chatId,
 		threadId: ctx.messageThreadId,
 		replyToMessageId: ctx.replyToMessageId
@@ -1798,7 +2744,9 @@ async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
 	let lastEditTime = 0;
 	let currentTool = "";
 	let turnTools = [];
+	let turnErrorText = null;
 	let afterToolResult = false;
+	let turnIndex = 0;
 	let aggregateText = "";
 	const aggregateTools = [];
 	let sessionId = null;
@@ -1811,16 +2759,26 @@ async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
 	let model = null;
 	let completed = false;
 	let interrupted = false;
-	const finalizeTurn = async () => {
+	const notifyTurnComplete = async (turn) => {
+		try {
+			await onTurnComplete?.(turn);
+		} catch (err) {
+			log.error({
+				err,
+				conversationId: ctx.conversationId
+			}, "turn completion observer failed");
+		}
+	};
+	const finalizeTurn = async (reason, turnTokens = {}) => {
 		if (currentSegment) {
 			textSegments.push(currentSegment);
 			currentSegment = "";
 		}
-		if (textSegments.length === 0 && !errorText && !interrupted) return;
+		if (textSegments.length === 0 && !turnErrorText && !interrupted) return null;
 		let finalText;
 		let finalSegments;
-		if (errorText) {
-			finalText = turnText ? `${truncate(turnText)}\n\n[Error: ${errorText}]` : `Error: ${errorText}`;
+		if (turnErrorText) {
+			finalText = turnText ? `${truncate(turnText)}\n\n[Error: ${turnErrorText}]` : `Error: ${turnErrorText}`;
 			finalSegments = [finalText];
 		} else if (interrupted && textSegments.length === 0) {
 			finalText = STREAM_INTERRUPTED_MARKER;
@@ -1829,7 +2787,39 @@ async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
 			finalText = turnText || "No response from Claude.";
 			finalSegments = textSegments;
 		}
-		await sendFinalResponse(client, ctx, messageId, finalText, finalSegments, lastEditText, log);
+		const delivery = await sendFinalResponse(client, ctx, messageId, finalText, finalSegments, lastEditText, log);
+		const completedTurn = {
+			turnIndex: ++turnIndex,
+			sessionId: turnTokens.sessionId ?? sessionId,
+			responseText: turnText || finalText,
+			toolHistory: [...turnTools],
+			error: turnErrorText,
+			interrupted,
+			inputTokens: turnTokens.inputTokens ?? null,
+			outputTokens: turnTokens.outputTokens ?? null,
+			contextWindow: turnTokens.contextWindow ?? contextWindow,
+			model,
+			delivery
+		};
+		log.info({
+			conversationId: ctx.conversationId,
+			backend: ctx.backend,
+			chatId: ctx.chatId,
+			threadId: ctx.messageThreadId,
+			sessionId: completedTurn.sessionId,
+			turnIndex: completedTurn.turnIndex,
+			reason,
+			responseLen: completedTurn.responseText.length,
+			responsePreview: redactedPreview(completedTurn.responseText),
+			toolCount: completedTurn.toolHistory.length,
+			messageIds: delivery.messageIds,
+			failedChunks: delivery.failedChunks,
+			fallbackChunks: delivery.fallbackChunks,
+			inputTokens: completedTurn.inputTokens,
+			outputTokens: completedTurn.outputTokens,
+			error: completedTurn.error,
+			interrupted: completedTurn.interrupted
+		}, "stream turn complete");
 		messageId = null;
 		turnText = "";
 		textSegments = [];
@@ -1838,7 +2828,9 @@ async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
 		lastEditTime = 0;
 		currentTool = "";
 		turnTools = [];
+		turnErrorText = null;
 		afterToolResult = false;
+		return completedTurn;
 	};
 	try {
 		try {
@@ -1883,10 +2875,19 @@ async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
 						if (event.inputTokens != null) inputTokens = event.inputTokens;
 						if (event.outputTokens != null) outputTokens = event.outputTokens;
 						if (event.contextWindow != null) contextWindow = event.contextWindow;
-						await finalizeTurn();
+						{
+							const turn = await finalizeTurn("turn_complete", {
+								sessionId: event.sessionId ?? sessionId,
+								inputTokens: event.inputTokens ?? null,
+								outputTokens: event.outputTokens ?? null,
+								contextWindow: event.contextWindow ?? null
+							});
+							if (turn) await notifyTurnComplete(turn);
+						}
 						break;
 					case "error":
 						errorText = event.message;
+						turnErrorText = event.message;
 						if (event.sessionId) sessionId = event.sessionId;
 						break;
 					case "session_meta":
@@ -1910,7 +2911,15 @@ async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
 		}
 		if (!completed && !errorText && !interrupted) interrupted = true;
 		timer?.mark("stream_complete");
-		await finalizeTurn();
+		{
+			const turn = await finalizeTurn("stream_end", {
+				sessionId,
+				inputTokens,
+				outputTokens,
+				contextWindow
+			});
+			if (turn) await notifyTurnComplete(turn);
+		}
 		timer?.mark("response_sent");
 	} finally {
 		clearInterval(typingInterval);
@@ -1920,7 +2929,7 @@ async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
 		threadId: ctx.messageThreadId,
 		sessionId,
 		responseLen: aggregateText.length,
-		responsePreview: aggregateText.slice(0, 200),
+		responsePreview: redactedPreview(aggregateText),
 		toolCount: aggregateTools.length,
 		interrupted,
 		error: errorText,
@@ -1942,12 +2951,23 @@ async function streamToTelegram(client, ctx, events, log, timer, onEvent) {
 }
 async function sendOrEdit(client, ctx, messageId, text, log) {
 	const truncated = truncate(text);
-	if (messageId === null) return (await client.sendMessage({
-		chat_id: ctx.chatId,
-		text: truncated,
-		...ctx.messageThreadId && { message_thread_id: ctx.messageThreadId }
-	})).message_id;
-	await tryEdit(client, ctx.chatId, messageId, truncated, log);
+	if (messageId === null) {
+		const msg = await client.sendMessage({
+			chat_id: ctx.chatId,
+			text: truncated,
+			...ctx.messageThreadId && { message_thread_id: ctx.messageThreadId }
+		});
+		log.debug({
+			conversationId: ctx.conversationId,
+			backend: ctx.backend,
+			chatId: ctx.chatId,
+			threadId: ctx.messageThreadId,
+			messageId: msg.message_id,
+			textLen: truncated.length
+		}, "telegram interim message sent");
+		return msg.message_id;
+	}
+	await tryEdit(client, ctx, messageId, truncated, log);
 	return messageId;
 }
 function buildDisplayText(text, currentTool, toolHistory) {
@@ -1970,22 +2990,21 @@ function truncate(text, limit = MAX_MESSAGE_LENGTH) {
 }
 async function trySendHtml(client, ctx, html, log) {
 	try {
-		await client.sendMessage({
+		return (await client.sendMessage({
 			chat_id: ctx.chatId,
 			text: html,
 			parse_mode: "HTML",
 			...ctx.messageThreadId && { message_thread_id: ctx.messageThreadId }
-		});
-		return true;
+		})).message_id;
 	} catch (err) {
 		log.warn({ err }, "HTML send failed, falling back to plain text");
-		return false;
+		return null;
 	}
 }
-async function tryEditHtml(client, chatId, messageId, html, log) {
+async function tryEditHtml(client, ctx, messageId, html, log) {
 	try {
 		await client.editMessageText({
-			chat_id: chatId,
+			chat_id: ctx.chatId,
 			message_id: messageId,
 			text: html,
 			parse_mode: "HTML"
@@ -1997,43 +3016,83 @@ async function tryEditHtml(client, chatId, messageId, html, log) {
 		return false;
 	}
 }
-async function tryEdit(client, chatId, messageId, text, log) {
+async function tryEdit(client, ctx, messageId, text, log) {
 	try {
 		await client.editMessageText({
-			chat_id: chatId,
+			chat_id: ctx.chatId,
 			message_id: messageId,
 			text: truncate(text)
 		});
+		log.debug({
+			conversationId: ctx.conversationId,
+			backend: ctx.backend,
+			chatId: ctx.chatId,
+			threadId: ctx.messageThreadId,
+			messageId,
+			textLen: text.length
+		}, "telegram interim message edited");
+		return true;
 	} catch (err) {
-		if (!String(err).includes("message is not modified")) log.debug({ err }, "edit message failed");
+		const msg = String(err);
+		if (!msg.includes("message is not modified")) log.debug({ err }, "edit message failed");
+		return msg.includes("message is not modified");
 	}
 }
 async function sendFinalResponse(client, ctx, messageId, plainText, segments, lastEditText, log) {
+	const delivery = {
+		messageIds: [],
+		chunks: 0,
+		failedChunks: 0,
+		fallbackChunks: 0
+	};
 	const chunks = splitHtml(buildFinalHtml(segments));
 	const firstChunk = chunks[0];
 	if (firstChunk) {
-		if (messageId !== null) {
-			if (!await tryEditHtml(client, ctx.chatId, messageId, firstChunk, log)) await tryEdit(client, ctx.chatId, messageId, truncate(plainText), log);
-		} else if (!await trySendHtml(client, ctx, firstChunk, log)) await trySendPlain(client, ctx, truncate(plainText), log);
+		delivery.chunks += 1;
+		if (messageId !== null) if (!await tryEditHtml(client, ctx, messageId, firstChunk, log)) {
+			delivery.fallbackChunks += 1;
+			if (await tryEdit(client, ctx, messageId, truncate(plainText), log)) delivery.messageIds.push(messageId);
+			else delivery.failedChunks += 1;
+		} else delivery.messageIds.push(messageId);
+		else {
+			const sent = await trySendHtml(client, ctx, firstChunk, log);
+			if (sent) delivery.messageIds.push(sent);
+			else {
+				delivery.fallbackChunks += 1;
+				const plainSent = await trySendPlain(client, ctx, truncate(plainText), log);
+				if (plainSent) delivery.messageIds.push(plainSent);
+				else delivery.failedChunks += 1;
+			}
+		}
 	}
 	for (let i = 1; i < chunks.length; i++) {
 		const chunk = chunks[i];
 		if (!chunk) continue;
-		if (!await trySendHtml(client, ctx, chunk, log)) {
+		delivery.chunks += 1;
+		const sent = await trySendHtml(client, ctx, chunk, log);
+		if (sent) delivery.messageIds.push(sent);
+		else {
+			delivery.fallbackChunks += 1;
 			const plainChunk = splitText(plainText, MAX_MESSAGE_LENGTH)[i];
-			if (plainChunk) await trySendPlain(client, ctx, plainChunk, log);
+			if (plainChunk) {
+				const plainSent = await trySendPlain(client, ctx, plainChunk, log);
+				if (plainSent) delivery.messageIds.push(plainSent);
+				else delivery.failedChunks += 1;
+			} else delivery.failedChunks += 1;
 		}
 	}
+	return delivery;
 }
 async function trySendPlain(client, ctx, text, log) {
 	try {
-		await client.sendMessage({
+		return (await client.sendMessage({
 			chat_id: ctx.chatId,
 			text,
 			...ctx.messageThreadId && { message_thread_id: ctx.messageThreadId }
-		});
+		})).message_id;
 	} catch (err) {
 		log.warn({ err }, "plain text send failed");
+		return null;
 	}
 }
 /**
@@ -2135,6 +3194,9 @@ function splitText(text, maxLen) {
 //#endregion
 //#region src/cron-handler.ts
 const CRON_IDLE_CLOSE_MS = 3e4;
+function isClaudeBackend$1(backendId) {
+	return backendId === "claude" || backendId === "claude-v2";
+}
 async function* withCronIdleClose(source, closeProc, idleMs) {
 	let timer = null;
 	const cancel = () => {
@@ -2222,7 +3284,7 @@ async function executeCronJob(job, deps, opts = {}) {
 	if (cronSystemPrompt !== void 0) jobOpts.systemPrompt = cronSystemPrompt;
 	const jobOptsArg = Object.keys(jobOpts).length > 0 ? jobOpts : void 0;
 	try {
-		if (backendId === "claude") try {
+		if (isClaudeBackend$1(backendId)) try {
 			await ensureFreshCliToken(log);
 		} catch (err) {
 			log.error({ err }, "CLI token warmup failed — proceeding anyway");
@@ -2247,6 +3309,8 @@ async function executeCronJob(job, deps, opts = {}) {
 		const threadId = opts.overrideThreadId ?? job.threadId;
 		let result;
 		if (chatId) result = await streamToTelegram(client, {
+			conversationId: cronConvId,
+			backend: backendId,
 			chatId,
 			messageThreadId: threadId
 		}, wrapped, log, timer, recordEvent);
@@ -2705,23 +3769,36 @@ var DailyFileStream = class {
 		this.currentDate = todayStr();
 		this.dest = pino.destination(join(logDir, `${this.currentDate}.log`));
 	}
+	flushCurrent() {
+		try {
+			this.dest.flushSync?.();
+		} catch {}
+	}
+	closeCurrent() {
+		this.flushCurrent();
+		try {
+			this.dest.end?.();
+		} catch {}
+	}
 	write(data) {
 		const today = todayStr();
 		if (today !== this.currentDate) {
-			this.dest.flushSync?.();
-			this.dest.end?.();
+			this.closeCurrent();
 			this.currentDate = today;
 			this.dest = pino.destination(join(this.logDir, `${today}.log`));
 		}
-		this.dest.write(data);
-		return true;
+		try {
+			this.dest.write(data);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 	flushSync() {
-		this.dest.flushSync?.();
+		this.flushCurrent();
 	}
 	end() {
-		this.dest.flushSync?.();
-		this.dest.end?.();
+		this.closeCurrent();
 	}
 };
 function createLogger(config) {
@@ -2853,6 +3930,22 @@ function pickBackend(ctx, opts, existing) {
 	if (channelDefault) return channelDefault;
 	return opts.backends.defaultId;
 }
+function isClaudeBackend(backendId) {
+	return backendId === "claude" || backendId === "claude-v2";
+}
+async function* sendMessageDirect(proc, content, timer) {
+	proc.sendInput(content, timer);
+	yield* proc.stream();
+}
+function firstTurnEvents(backendId, proc, pool, conversationId, resumeSessionId, overrides, content, timer, log) {
+	if (backendId === "claude-v2") return sendMessageDirect(proc, content, timer);
+	return sendMessageWithAuthRetry(proc, () => pool.getOrCreate(conversationId, resumeSessionId, timer, overrides), () => pool.remove(conversationId), content, timer, log);
+}
+function persistSessionId(opts, conversationId, sessionId, backendId) {
+	if (!sessionId) return;
+	opts.sessionStore.setSession(conversationId, sessionId, backendId);
+	opts.pendingBackends.clear(conversationId);
+}
 const sessions = /* @__PURE__ */ new Map();
 const MAX_QUEUE_SIZE = 10;
 const QUEUE_ACK_EMOJI = "👀";
@@ -2870,7 +3963,7 @@ function pendingItemLogFields(item) {
 		kind: item.kind,
 		messageId: firstMsg.message_id,
 		textLen: text?.length ?? 0,
-		textPreview: text?.slice(0, 200) ?? "[media]",
+		textPreview: text ? redactedPreview(text) : "[media]",
 		...item.kind === "group" && { groupSize: item.messages.length }
 	};
 }
@@ -3026,15 +4119,17 @@ async function dispatchPendingItem(client, session, item, log, opts) {
 					sessionId: session.proc.sessionId,
 					blocks: content.length,
 					textLen: text.length,
-					textPreview: text.slice(0, 200),
+					textPreview: redactedPreview(text),
 					kind: "single"
 				}, "dispatching to backend CLI");
+				session.activeTurn = activeTurnFromMessage(extractMessageContext(item.message), item.message, text);
 				session.proc.sendInput(content);
 			}
 		} else {
 			const content = await buildGroupContent(client, item.messages, log, opts);
 			if (content && content.length > 0) {
 				const text = describeContentBlocks(content);
+				const first = item.messages[0];
 				opts.sessionRecorder.recordUserInput(session.conversationId, text);
 				log.info({
 					conversationId: session.conversationId,
@@ -3042,9 +4137,10 @@ async function dispatchPendingItem(client, session, item, log, opts) {
 					sessionId: session.proc.sessionId,
 					blocks: content.length,
 					textLen: text.length,
-					textPreview: text.slice(0, 200),
+					textPreview: redactedPreview(text),
 					kind: "group"
 				}, "dispatching to backend CLI");
+				session.activeTurn = activeTurnFromMessage(extractMessageContext(first), first, text);
 				session.proc.sendInput(content);
 			}
 		}
@@ -3057,6 +4153,20 @@ function describeContentBlocks(blocks) {
 	for (const block of blocks) if (block.type === "text") parts.push(block.text);
 	else if (block.type === "image") parts.push("[image]");
 	return parts.join("\n").trim() || "[media]";
+}
+function activeTurnFromMessage(ctx, message, input, inputDescription = input) {
+	return {
+		startedAt: Date.now(),
+		input,
+		inputDescription,
+		sender: {
+			id: ctx.senderId,
+			name: ctx.senderName,
+			username: ctx.senderUsername
+		},
+		messageId: message.message_id,
+		textPreview: redactedPreview(input)
+	};
 }
 /**
 * Spawn a new ClaudeProcess for this conversation, attach a long-running
@@ -3087,13 +4197,15 @@ async function startSession(client, message, log, opts, timer) {
 		hasDocument: !!message.document
 	}, "routing first message — starting session");
 	t.mark("claude_invoke");
-	if (backendId === "claude") try {
+	if (isClaudeBackend(backendId)) try {
 		await ensureFreshCliToken(log);
 	} catch (err) {
 		log.error({ err }, "CLI token warmup failed — proceeding anyway");
 	}
 	const overrides = buildProcessOverrides(opts, ctx);
-	const proc = pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides);
+	const resumeSessionId = opts.pendingBackends.get(ctx.conversationId) ? null : existingSession?.sessionId ?? null;
+	const proc = pool.getOrCreate(ctx.conversationId, resumeSessionId, t, overrides);
+	persistSessionId(opts, ctx.conversationId, proc.sessionId, backendId);
 	opts.sessionRecorder.start({
 		conversationId: ctx.conversationId,
 		backend: backendId
@@ -3106,12 +4218,14 @@ async function startSession(client, message, log, opts, timer) {
 		sessionId: existingSession?.sessionId ?? null,
 		blocks: content.length,
 		textLen: dispatchText.length,
-		textPreview: dispatchText.slice(0, 200),
+		textPreview: redactedPreview(dispatchText),
 		kind: "single",
 		firstTurn: true
 	}, "dispatching to backend CLI");
-	const events = sendMessageWithAuthRetry(proc, () => pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides), () => pool.remove(ctx.conversationId), content, t, log);
+	const events = firstTurnEvents(backendId, proc, pool, ctx.conversationId, resumeSessionId, overrides, content, t, log);
 	const streamingContext = {
+		conversationId: ctx.conversationId,
+		backend: backendId,
 		chatId: ctx.chatId,
 		messageThreadId: message.message_thread_id,
 		replyToMessageId: message.message_id
@@ -3124,10 +4238,16 @@ async function startSession(client, message, log, opts, timer) {
 		streamingContext,
 		pending: [],
 		submitInFlight: false,
-		unsubscribeQuiescent: () => {}
+		unsubscribeQuiescent: () => {},
+		activeTurn: activeTurnFromMessage(ctx, message, dispatchText, inputDescription)
 	};
 	sessions.set(ctx.conversationId, session);
-	session.forwarder = streamToTelegram(client, streamingContext, events, log, t, (event) => opts.sessionRecorder.recordEvent(ctx.conversationId, event)).then((result) => {
+	session.forwarder = streamToTelegram(client, streamingContext, events, log, t, (event) => {
+		opts.sessionRecorder.recordEvent(ctx.conversationId, event);
+		if (event.type === "turn_complete") {
+			if (sessions.get(ctx.conversationId) === session) persistSessionId(opts, ctx.conversationId, event.sessionId, backendId);
+		}
+	}, backendId === "claude-v2" ? (turn) => handleSessionTurnComplete(ctx, session, turn, backendId, opts, log) : void 0).then((result) => {
 		t.mark("done");
 		if (sessions.get(ctx.conversationId) !== session) return result;
 		handleSessionResult(ctx, message, inputDescription, result, backendId, t, opts, log);
@@ -3182,6 +4302,50 @@ async function drainPending(client, session, log, opts) {
 	}, "draining queued message");
 	await dispatchPendingItem(client, session, next, log, opts);
 }
+function handleSessionTurnComplete(ctx, session, turn, backendId, opts, log) {
+	const sessionId = turn.sessionId ?? session.proc.sessionId;
+	if (sessionId) {
+		opts.sessionStore.setSession(ctx.conversationId, sessionId, backendId);
+		opts.pendingBackends.clear(ctx.conversationId);
+	}
+	const input = session.activeTurn;
+	const durationMs = input ? Date.now() - input.startedAt : 0;
+	if (sessionId) opts.conversationLogger.log({
+		timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+		conversationId: ctx.conversationId,
+		sessionId,
+		sender: input?.sender ?? {
+			id: ctx.senderId,
+			name: ctx.senderName,
+			username: ctx.senderUsername
+		},
+		input: input?.inputDescription ?? "[unknown input]",
+		output: turn.responseText,
+		tools: turn.toolHistory,
+		durationMs,
+		error: turn.error ?? (turn.interrupted ? "stream interrupted" : null),
+		timings: { turn_duration_ms: durationMs }
+	});
+	log.info({
+		conversationId: ctx.conversationId,
+		backend: backendId,
+		sessionId,
+		turnIndex: turn.turnIndex,
+		durationMs,
+		inputMessageId: input?.messageId,
+		inputPreview: input?.textPreview,
+		responseLen: turn.responseText.length,
+		responsePreview: redactedPreview(turn.responseText),
+		toolCount: turn.toolHistory.length,
+		telegramMessageIds: turn.delivery.messageIds,
+		telegramFailedChunks: turn.delivery.failedChunks,
+		inputTokens: turn.inputTokens,
+		outputTokens: turn.outputTokens,
+		error: turn.error,
+		interrupted: turn.interrupted
+	}, "claude turn complete");
+	session.activeTurn = null;
+}
 /**
 * Persist session metadata + log to disk after a turn finishes. Wired
 * onto the long-running forwarder's resolution; runs once when the
@@ -3195,6 +4359,16 @@ async function drainPending(client, session, log, opts) {
 function handleSessionResult(ctx, firstMessage, inputDescription, result, backendId, t, opts, log) {
 	const sessionId = result.sessionId;
 	if (!sessionId) return;
+	if (backendId === "claude-v2") {
+		log.info({
+			conversationId: ctx.conversationId,
+			sessionId,
+			responseLen: result.responseText.length,
+			toolCount: result.toolHistory.length,
+			error: result.error ?? (result.interrupted ? "stream interrupted" : null)
+		}, "claude-v2 stream ended");
+		return;
+	}
 	opts.sessionStore.setSession(ctx.conversationId, sessionId, backendId);
 	opts.pendingBackends.clear(ctx.conversationId);
 	opts.conversationLogger.log({
@@ -3217,7 +4391,7 @@ function handleSessionResult(ctx, firstMessage, inputDescription, result, backen
 		conversationId: ctx.conversationId,
 		timings: t.summary(),
 		tools: result.toolHistory.length,
-		triggeredBy: extractText(firstMessage)?.slice(0, 60) ?? "[media]"
+		triggeredBy: redactedPreview(extractText(firstMessage), 60) || "[media]"
 	}, "claude session ended");
 }
 async function buildContent(client, message, cleanText, log) {
@@ -3304,18 +4478,18 @@ async function handleStatsCommand(client, conversationId, message, opts) {
 	});
 }
 /**
-* Match `/new-claude`, `/new_claude`, `/new-codex`, or `/new_codex` (with
-* optional `@botname` suffix and trailing whitespace). Telegram's BotFather
-* menu only allows `[a-z0-9_]` so the registered commands use underscores;
-* we accept hyphens too because it's natural to type. No bare `/new` —
-* explicit commands only, since argument parsing was a regular source of
-* confusion ("did the bot read codex or did it default?").
+* Match `/new-claude`, `/new-claude-v2`, `/new-claudev2`, `/new-codex` and underscore
+* variants (with optional `@botname` suffix and trailing whitespace).
+* Telegram's BotFather menu only allows `[a-z0-9_]` so the registered
+* commands use underscores; we accept hyphens too because it's natural to
+* type. No bare `/new` — explicit commands only, since argument parsing was
+* a regular source of confusion ("did the bot read codex or did it default?").
 */
 function matchNewBackendCommand(text) {
 	if (!text) return null;
-	const m = text.match(/^\/new[-_](claude|codex)(@\S+)?(\s|$)/i);
+	const m = text.match(/^\/new[-_](claude(?:[-_]?v2)?|codex)(@\S+)?(\s|$)/i);
 	if (!m) return null;
-	const backend = m[1]?.toLowerCase();
+	const backend = (m[1]?.toLowerCase())?.replace(/^claude[-_]?v2$/, "claude-v2");
 	return isBackendId(backend ?? "") ? backend : null;
 }
 async function handleNewBackendCommand(client, conversationId, message, backend, opts, log) {
@@ -3324,7 +4498,7 @@ async function handleNewBackendCommand(client, conversationId, message, backend,
 		...message.message_thread_id && { message_thread_id: message.message_thread_id },
 		reply_parameters: { message_id: message.message_id }
 	};
-	for (const id of ["claude", "codex"]) opts.backends.pool(id).remove(conversationId);
+	for (const id of BACKEND_IDS) opts.backends.pool(id).remove(conversationId);
 	opts.sessionStore.deleteSession(conversationId);
 	opts.sessionRecorder.delete(conversationId);
 	const session = sessions.get(conversationId);
@@ -3423,13 +4597,15 @@ async function startSessionFromGroup(client, messages, log, opts) {
 		docCount
 	}, "routing media group — starting session");
 	t.mark("claude_invoke");
-	if (backendId === "claude") try {
+	if (isClaudeBackend(backendId)) try {
 		await ensureFreshCliToken(log);
 	} catch (err) {
 		log.error({ err }, "CLI token warmup failed — proceeding anyway");
 	}
 	const overrides = buildProcessOverrides(opts, ctx);
-	const proc = pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides);
+	const resumeSessionId = opts.pendingBackends.get(ctx.conversationId) ? null : existingSession?.sessionId ?? null;
+	const proc = pool.getOrCreate(ctx.conversationId, resumeSessionId, t, overrides);
+	persistSessionId(opts, ctx.conversationId, proc.sessionId, backendId);
 	opts.sessionRecorder.start({
 		conversationId: ctx.conversationId,
 		backend: backendId
@@ -3442,12 +4618,14 @@ async function startSessionFromGroup(client, messages, log, opts) {
 		sessionId: existingSession?.sessionId ?? null,
 		blocks: content.length,
 		textLen: dispatchText.length,
-		textPreview: dispatchText.slice(0, 200),
+		textPreview: redactedPreview(dispatchText),
 		kind: "group",
 		firstTurn: true
 	}, "dispatching to backend CLI");
-	const events = sendMessageWithAuthRetry(proc, () => pool.getOrCreate(ctx.conversationId, existingSession?.sessionId ?? null, t, overrides), () => pool.remove(ctx.conversationId), content, t, log);
+	const events = firstTurnEvents(backendId, proc, pool, ctx.conversationId, resumeSessionId, overrides, content, t, log);
 	const streamingContext = {
+		conversationId: ctx.conversationId,
+		backend: backendId,
 		chatId: ctx.chatId,
 		messageThreadId: first.message_thread_id,
 		replyToMessageId: first.message_id
@@ -3460,10 +4638,16 @@ async function startSessionFromGroup(client, messages, log, opts) {
 		streamingContext,
 		pending: [],
 		submitInFlight: false,
-		unsubscribeQuiescent: () => {}
+		unsubscribeQuiescent: () => {},
+		activeTurn: activeTurnFromMessage(ctx, first, dispatchText, inputDescription)
 	};
 	sessions.set(ctx.conversationId, session);
-	session.forwarder = streamToTelegram(client, streamingContext, events, log, t, (event) => opts.sessionRecorder.recordEvent(ctx.conversationId, event)).then((result) => {
+	session.forwarder = streamToTelegram(client, streamingContext, events, log, t, (event) => {
+		opts.sessionRecorder.recordEvent(ctx.conversationId, event);
+		if (event.type === "turn_complete") {
+			if (sessions.get(ctx.conversationId) === session) persistSessionId(opts, ctx.conversationId, event.sessionId, backendId);
+		}
+	}, backendId === "claude-v2" ? (turn) => handleSessionTurnComplete(ctx, session, turn, backendId, opts, log) : void 0).then((result) => {
 		t.mark("done");
 		if (sessions.get(ctx.conversationId) !== session) return result;
 		handleSessionResult(ctx, first, inputDescription, result, backendId, t, opts, log);
@@ -3606,7 +4790,7 @@ function summarizeUpdate(update) {
 		hasDocument: !!msg.document,
 		hasMediaGroup: !!msg.media_group_id,
 		textLen: text?.length ?? 0,
-		textPreview: text ? text.slice(0, TEXT_PREVIEW_MAX) : null,
+		textPreview: text ? redactedPreview(text, TEXT_PREVIEW_MAX) : null,
 		replyToMessageId: msg.reply_to_message?.message_id
 	};
 }
@@ -3615,7 +4799,7 @@ async function startPolling(client, log, signal, opts) {
 	const pollLog = log.child({ component: "poller" });
 	pollLog.info("starting long-poll loop");
 	while (!signal.aborted) try {
-		const updates = await client.getUpdates(offset, 30);
+		const updates = await client.getUpdates(offset, 30, signal);
 		for (const update of updates) {
 			offset = update.update_id + 1;
 			pollLog.info(summarizeUpdate(update), "telegram update received");
@@ -3671,7 +4855,6 @@ function createApp(opts) {
 //#endregion
 //#region src/session-stats/compaction.ts
 const COMPACTION_DROP_RATIO = .7;
-const BEFORE_WINDOW = 10;
 const AFTER_WINDOW = 5;
 function findCompactionBoundaries(messages) {
 	const explicit = [];
@@ -3700,7 +4883,7 @@ function countMidTaskCompactions(messages) {
 	if (calls.length === 0) return 0;
 	let mid = 0;
 	for (const b of boundaries) {
-		const before = calls.filter((c) => c.ordinal < b).slice(-BEFORE_WINDOW);
+		const before = calls.filter((c) => c.ordinal < b).slice(-10);
 		const after = calls.filter((c) => c.ordinal > b).slice(0, AFTER_WINDOW);
 		const beforeNames = new Set(before.map((c) => c.name));
 		let overlap = 0;
@@ -4311,6 +5494,7 @@ var TelegramRateLimitError = class extends Error {
 	}
 };
 var TelegramClient = class {
+	token;
 	baseUrl;
 	log;
 	constructor(token, opts = {}) {
@@ -4321,10 +5505,10 @@ var TelegramClient = class {
 	async getMe() {
 		return this.call("getMe");
 	}
-	async getUpdates(offset, timeout = 30) {
+	async getUpdates(offset, timeout = 30, signal) {
 		const params = { timeout: String(timeout) };
 		if (offset !== void 0) params.offset = String(offset);
-		return this.call("getUpdates", params);
+		return this.call("getUpdates", params, { signal });
 	}
 	async sendMessage(params) {
 		return this.call("sendMessage", { ...params });
@@ -4373,7 +5557,7 @@ var TelegramClient = class {
 		if (!res.ok) throw new Error(`Telegram file download failed: ${res.status} ${res.statusText}`);
 		return Buffer.from(await res.arrayBuffer());
 	}
-	async call(method, body) {
+	async call(method, body, opts = {}) {
 		let rateLimitAttempt = 0;
 		let networkAttempt = 0;
 		while (true) {
@@ -4382,9 +5566,11 @@ var TelegramClient = class {
 				res = await fetch(`${this.baseUrl}/${method}`, {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: body ? JSON.stringify(body) : void 0
+					body: body ? JSON.stringify(body) : void 0,
+					signal: opts.signal
 				});
 			} catch (err) {
+				if (opts.signal?.aborted) throw err;
 				if (networkAttempt >= NETWORK_RETRY_COUNT) throw err;
 				const delay = NETWORK_RETRY_DELAY_MS * 2 ** networkAttempt;
 				networkAttempt += 1;
@@ -4434,7 +5620,7 @@ async function runInstance({ instancePath }) {
 		name: me.first_name
 	}, "authenticated");
 	let access = loadAccessConfig(config.accessFile, log);
-	watchAccessConfig(config.accessFile, (updated) => {
+	const stopAccessWatch = watchAccessConfig(config.accessFile, (updated) => {
 		access = updated;
 	}, log);
 	const bindings = loadBindingConfig(config.bindingsFile, log);
@@ -4451,19 +5637,32 @@ async function runInstance({ instancePath }) {
 	const claudeOpts = {
 		workingDir: config.claudeWorkingDir,
 		model: config.claudeModel,
-		cronFilePath: config.cronFile
+		cronFilePath: config.cronFile,
+		stateDir: join(config.instancePath, "data/claude-v2"),
+		log
 	};
 	const codexOpts = {
 		workingDir: config.claudeWorkingDir,
 		model: config.codexModel,
-		cronFilePath: config.cronFile
+		cronFilePath: config.cronFile,
+		log
 	};
 	const claudePool = new ProcessPool(claudeOpts);
+	const claudeV2Pool = new ClaudeInteractiveProcessPool(claudeOpts);
 	const codexPool = new CodexProcessPool(codexOpts);
 	const claudeCronPool = new CronProcessPool(claudeOpts);
+	const claudeV2CronPool = new CronProcessPool(claudeOpts);
 	const codexCronPool = new CodexCronProcessPool(codexOpts);
-	const backendPools = new Map([["claude", claudePool], ["codex", codexPool]]);
-	const backendCronPools = new Map([["claude", claudeCronPool], ["codex", codexCronPool]]);
+	const backendPools = new Map([
+		["claude", claudePool],
+		["claude-v2", claudeV2Pool],
+		["codex", codexPool]
+	]);
+	const backendCronPools = new Map([
+		["claude", claudeCronPool],
+		["claude-v2", claudeV2CronPool],
+		["codex", codexCronPool]
+	]);
 	const backends = new DefaultBackendRegistry(config.defaultBackend, backendPools, backendCronPools);
 	const pendingBackends = new PendingBackendStore();
 	log.info({ defaultBackend: config.defaultBackend }, "backends ready");
@@ -4494,7 +5693,7 @@ async function runInstance({ instancePath }) {
 		},
 		log
 	});
-	watchCronConfig(config.cronFile, (updated) => {
+	const stopCronWatch = watchCronConfig(config.cronFile, (updated) => {
 		cronConfig = updated;
 		cronScheduler.onConfigReload(updated);
 		registerCronCommands(client, updated, log);
@@ -4523,6 +5722,8 @@ async function runInstance({ instancePath }) {
 		notifyStopping();
 		stopWatchdog();
 		ac.abort();
+		stopAccessWatch();
+		stopCronWatch();
 		cronScheduler.stop();
 		backends.closeAll();
 		sessionStore.close();
@@ -4570,6 +5771,14 @@ async function registerCronCommands(client, config, log) {
 			description: "Start fresh — use Claude"
 		},
 		{
+			command: "new_claude_v2",
+			description: "Start fresh — use Claude v2"
+		},
+		{
+			command: "new_claudev2",
+			description: "Start fresh — use Claude v2"
+		},
+		{
 			command: "new_codex",
 			description: "Start fresh — use Codex"
 		},
@@ -4590,7 +5799,7 @@ async function registerCronCommands(client, config, log) {
 		await client.setMyCommands(commands);
 		log.info({
 			count: commands.length,
-			cron: commands.length - 4
+			cron: commands.length - 6
 		}, "registered bot commands");
 	} catch (err) {
 		log.error({ err }, "setMyCommands failed — continuing without refresh");

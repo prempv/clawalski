@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync, readdirSync, renameSync } from "node:fs";
 import { basename, join } from "node:path";
+import { redactSensitiveText } from "./redaction.js";
 
 export interface ConversationLogEntry {
 	timestamp: string;
@@ -66,8 +67,18 @@ export function createConversationLogger(logDir: string): ConversationLogger {
 	return {
 		log(entry: ConversationLogEntry): void {
 			const filepath = resolveFile(entry.sessionId, entry.conversationId);
-			appendFileSync(filepath, `${JSON.stringify(entry)}\n`);
+			appendFileSync(filepath, `${JSON.stringify(redactEntry(entry))}\n`);
 		},
+	};
+}
+
+function redactEntry(entry: ConversationLogEntry): ConversationLogEntry {
+	return {
+		...entry,
+		input: redactSensitiveText(entry.input),
+		output: redactSensitiveText(entry.output),
+		tools: entry.tools.map(redactSensitiveText),
+		error: entry.error ? redactSensitiveText(entry.error) : null,
 	};
 }
 

@@ -142,10 +142,12 @@ function mockCronPool(id: BackendId): BackendCronPool {
 function mockBackends(): BackendRegistry {
 	const pools = new Map<BackendId, BackendPool>([
 		["claude", mockPool("claude")],
+		["claude-v2", mockPool("claude-v2")],
 		["codex", mockPool("codex")],
 	]);
 	const cronPools = new Map<BackendId, BackendCronPool>([
 		["claude", mockCronPool("claude")],
+		["claude-v2", mockCronPool("claude-v2")],
 		["codex", mockCronPool("codex")],
 	]);
 	return {
@@ -243,16 +245,83 @@ describe("handleUpdate — command routing", () => {
 		);
 	});
 
+	it("/new-claude-v2 clears session and pins claude-v2", async () => {
+		const client = mockClient();
+		const pending = new PendingBackendStore();
+
+		await handleUpdate(
+			client,
+			makeDmUpdate("/new-claude-v2"),
+			mockLogger() as never,
+			makeOpts({ pendingBackends: pending }),
+		);
+
+		expect(pending.get("tg:dm:1")).toBe("claude-v2");
+		expect(client.sendMessage).toHaveBeenCalledWith(
+			expect.objectContaining({
+				text: expect.stringContaining("claude-v2"),
+			}),
+		);
+	});
+
+	it("/new_claude_v2 clears session and pins claude-v2", async () => {
+		const client = mockClient();
+		const pending = new PendingBackendStore();
+
+		await handleUpdate(
+			client,
+			makeDmUpdate("/new_claude_v2"),
+			mockLogger() as never,
+			makeOpts({ pendingBackends: pending }),
+		);
+
+		expect(pending.get("tg:dm:1")).toBe("claude-v2");
+	});
+
+	it("/new-claudev2 clears session and pins claude-v2", async () => {
+		const client = mockClient();
+		const pending = new PendingBackendStore();
+
+		await handleUpdate(
+			client,
+			makeDmUpdate("/new-claudev2"),
+			mockLogger() as never,
+			makeOpts({ pendingBackends: pending }),
+		);
+
+		expect(pending.get("tg:dm:1")).toBe("claude-v2");
+	});
+
+	it("/new_claudev2 clears session and pins claude-v2", async () => {
+		const client = mockClient();
+		const pending = new PendingBackendStore();
+
+		await handleUpdate(
+			client,
+			makeDmUpdate("/new_claudev2"),
+			mockLogger() as never,
+			makeOpts({ pendingBackends: pending }),
+		);
+
+		expect(pending.get("tg:dm:1")).toBe("claude-v2");
+	});
+
 	it("/new-codex tears down both backend pools (orphan-proof teardown)", async () => {
 		// Older codex orphan procs from earlier failed attempts must be killed
 		// when the user runs /new-codex, so they can't write a wrong-backend
 		// row to sessionStore after we've cleared the conversation.
 		const client = mockClient();
 		const claudePool = mockPool("claude");
+		const claudeV2Pool = mockPool("claude-v2");
 		const codexPool = mockPool("codex");
 		const backends: BackendRegistry = {
 			defaultId: "claude",
-			pool: (id: BackendId) => (id === "claude" ? claudePool : codexPool),
+			pool: (id: BackendId) =>
+				id === "claude"
+					? claudePool
+					: id === "claude-v2"
+						? claudeV2Pool
+						: codexPool,
 			cronPool: (_id: BackendId) =>
 				({}) as unknown as ReturnType<BackendRegistry["cronPool"]>,
 			closeAll: vi.fn(),
@@ -266,6 +335,7 @@ describe("handleUpdate — command routing", () => {
 		);
 
 		expect(claudePool.remove).toHaveBeenCalledWith("tg:dm:1");
+		expect(claudeV2Pool.remove).toHaveBeenCalledWith("tg:dm:1");
 		expect(codexPool.remove).toHaveBeenCalledWith("tg:dm:1");
 	});
 
@@ -273,10 +343,16 @@ describe("handleUpdate — command routing", () => {
 		const client = mockClient();
 		const pending = new PendingBackendStore();
 		const claudePool = mockPool("claude");
+		const claudeV2Pool = mockPool("claude-v2");
 		const codexPool = mockPool("codex");
 		const backends: BackendRegistry = {
 			defaultId: "claude",
-			pool: (id: BackendId) => (id === "claude" ? claudePool : codexPool),
+			pool: (id: BackendId) =>
+				id === "claude"
+					? claudePool
+					: id === "claude-v2"
+						? claudeV2Pool
+						: codexPool,
 			cronPool: (_id: BackendId) =>
 				({}) as unknown as ReturnType<BackendRegistry["cronPool"]>,
 			closeAll: vi.fn(),
@@ -294,6 +370,7 @@ describe("handleUpdate — command routing", () => {
 		// Pools should NOT be torn down for plain text — would only happen
 		// if the new-backend command path matched.
 		expect(claudePool.remove).not.toHaveBeenCalled();
+		expect(claudeV2Pool.remove).not.toHaveBeenCalled();
 		expect(codexPool.remove).not.toHaveBeenCalled();
 	});
 
@@ -327,6 +404,20 @@ describe("handleUpdate — command routing", () => {
 		expect(pending.get("tg:dm:1")).toBe("codex");
 	});
 
+	it("/new-claude-v2@SomeBot (group-mention form) still matches", async () => {
+		const client = mockClient();
+		const pending = new PendingBackendStore();
+
+		await handleUpdate(
+			client,
+			makeDmUpdate("/new-claude-v2@TestBot"),
+			mockLogger() as never,
+			makeOpts({ pendingBackends: pending }),
+		);
+
+		expect(pending.get("tg:dm:1")).toBe("claude-v2");
+	});
+
 	it("/new_codex (underscore form, used by BotFather menu) also matches", async () => {
 		const client = mockClient();
 		const pending = new PendingBackendStore();
@@ -346,6 +437,7 @@ describe("handleUpdate — backend selection (pickBackend)", () => {
 	function backendsWithDistinguishablePools(): {
 		backends: BackendRegistry;
 		claudePool: BackendPool;
+		claudeV2Pool: BackendPool;
 		codexPool: BackendPool;
 	} {
 		const claudePool = mockPool("claude", () =>
@@ -358,15 +450,26 @@ describe("handleUpdate — backend selection (pickBackend)", () => {
 				{ type: "turn_complete", sessionId: "codex-session" },
 			]),
 		);
+		const claudeV2Pool = mockPool("claude-v2", () =>
+			fakeConversationProcess([
+				{ type: "turn_complete", sessionId: "claude-v2-session" },
+			]),
+		);
 		return {
 			backends: {
 				defaultId: "claude",
-				pool: (id: BackendId) => (id === "claude" ? claudePool : codexPool),
+				pool: (id: BackendId) =>
+					id === "claude"
+						? claudePool
+						: id === "claude-v2"
+							? claudeV2Pool
+							: codexPool,
 				cronPool: (_id: BackendId) =>
 					({}) as unknown as ReturnType<BackendRegistry["cronPool"]>,
 				closeAll: vi.fn(),
 			},
 			claudePool,
+			claudeV2Pool,
 			codexPool,
 		};
 	}
@@ -412,6 +515,98 @@ describe("handleUpdate — backend selection (pickBackend)", () => {
 
 		expect(codexPool.getOrCreate).toHaveBeenCalled();
 		expect(claudePool.getOrCreate).not.toHaveBeenCalled();
+	});
+
+	it("stored claude-v2 session routes via claude-v2", async () => {
+		const client = mockClient();
+		const { backends, claudePool, claudeV2Pool, codexPool } =
+			backendsWithDistinguishablePools();
+		const store = mockSessionStore();
+		store.setSession("tg:dm:1", "claude-v2-session", "claude-v2");
+
+		await handleUpdate(
+			client,
+			makeDmUpdate("hello"),
+			mockLogger() as never,
+			makeOpts({ backends, sessionStore: store }),
+		);
+
+		expect(claudeV2Pool.getOrCreate).toHaveBeenCalled();
+		expect(claudePool.getOrCreate).not.toHaveBeenCalled();
+		expect(codexPool.getOrCreate).not.toHaveBeenCalled();
+	});
+
+	it("writes durable history for each claude-v2 turn", async () => {
+		const client = mockClient();
+		const conversationLogger = { log: vi.fn() };
+		const claudeV2Pool = mockPool("claude-v2", () =>
+			fakeConversationProcess([
+				{ type: "text_delta", content: "done" },
+				{ type: "turn_complete", sessionId: "claude-v2-session" },
+			]),
+		);
+		const backends: BackendRegistry = {
+			defaultId: "claude-v2",
+			pool: () => claudeV2Pool,
+			cronPool: () =>
+				({}) as unknown as ReturnType<BackendRegistry["cronPool"]>,
+			closeAll: vi.fn(),
+		};
+
+		await handleUpdate(
+			client,
+			makeDmUpdate("hello"),
+			mockLogger() as never,
+			makeOpts({ backends, conversationLogger }),
+		);
+		await new Promise((r) => setTimeout(r, 10));
+
+		expect(conversationLogger.log).toHaveBeenCalledTimes(1);
+		expect(conversationLogger.log).toHaveBeenCalledWith(
+			expect.objectContaining({
+				conversationId: "tg:dm:1",
+				sessionId: "claude-v2-session",
+				input: "hello",
+				output: "done",
+			}),
+		);
+	});
+
+	it("end-to-end: /new-claude-v2 followed by a message routes via claude-v2", async () => {
+		const client = mockClient();
+		const { backends, claudePool, claudeV2Pool, codexPool } =
+			backendsWithDistinguishablePools();
+		const store = mockSessionStore();
+		store.setSession("tg:dm:1", "stale-claude-session", "claude");
+		const pending = new PendingBackendStore();
+		const opts = makeOpts({
+			backends,
+			sessionStore: store,
+			pendingBackends: pending,
+		});
+
+		await handleUpdate(
+			client,
+			makeDmUpdate("/new-claude-v2"),
+			mockLogger() as never,
+			opts,
+		);
+		store.setSession("tg:dm:1", "stale-claude-session", "claude");
+
+		await handleUpdate(
+			client,
+			{
+				...makeDmUpdate("read this"),
+				update_id: 2,
+				message: { ...makeDmUpdate("read this").message, message_id: 2 },
+			} as TelegramUpdate,
+			mockLogger() as never,
+			opts,
+		);
+
+		expect(claudeV2Pool.getOrCreate).toHaveBeenCalled();
+		expect(claudePool.getOrCreate).not.toHaveBeenCalled();
+		expect(codexPool.getOrCreate).not.toHaveBeenCalled();
 	});
 
 	it("end-to-end: /new-codex followed by a message routes via codex", async () => {

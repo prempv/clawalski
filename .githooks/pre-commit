@@ -21,6 +21,7 @@ else
     '[0-9]{8,10}:[A-Za-z0-9_-]{35}'              # Telegram bot token
     'sk-ant-[A-Za-z0-9_-]{20,}'                  # Anthropic API key
     'sk-proj-[A-Za-z0-9_-]{20,}'                 # OpenAI project key
+    'bb''_live_[A-Za-z0-9_-]{16,}'               # Browserbase API key
     'ghp_[A-Za-z0-9]{36}'                         # GitHub PAT
     'github_pat_[A-Za-z0-9_]{82}'                # GitHub fine-grained PAT
     'AKIA[0-9A-Z]{16}'                            # AWS access key
@@ -32,6 +33,7 @@ else
     'Telegram bot token'
     'Anthropic API key'
     'OpenAI project key'
+    'Browserbase API key'
     'GitHub personal access token'
     'GitHub fine-grained PAT'
     'AWS access key'

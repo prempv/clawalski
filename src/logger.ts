@@ -26,25 +26,44 @@ class DailyFileStream {
 		this.dest = pino.destination(join(logDir, `${this.currentDate}.log`));
 	}
 
+	private flushCurrent(): void {
+		try {
+			this.dest.flushSync?.();
+		} catch {
+			// SonicBoom can still be opening while systemd is stopping us.
+		}
+	}
+
+	private closeCurrent(): void {
+		this.flushCurrent();
+		try {
+			(this.dest as { end?: () => void }).end?.();
+		} catch {
+			// Best effort on shutdown.
+		}
+	}
+
 	write(data: string): boolean {
 		const today = todayStr();
 		if (today !== this.currentDate) {
-			this.dest.flushSync?.();
-			(this.dest as { end?: () => void }).end?.();
+			this.closeCurrent();
 			this.currentDate = today;
 			this.dest = pino.destination(join(this.logDir, `${today}.log`));
 		}
-		this.dest.write(data);
-		return true;
+		try {
+			this.dest.write(data);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	flushSync(): void {
-		this.dest.flushSync?.();
+		this.flushCurrent();
 	}
 
 	end(): void {
-		this.dest.flushSync?.();
-		(this.dest as { end?: () => void }).end?.();
+		this.closeCurrent();
 	}
 }
 

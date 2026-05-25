@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type {
 	BackendBridgeOptions,
+	BackendId,
 	BackendRegistry,
 	BackendStreamEvent,
 	ConversationProcess,
@@ -32,6 +33,10 @@ import type { ContentBlock } from "./types.js";
 // ---------------------------------------------------------------------------
 
 const CRON_IDLE_CLOSE_MS = 30_000;
+
+function isClaudeBackend(backendId: BackendId): boolean {
+	return backendId === "claude" || backendId === "claude-v2";
+}
 
 async function* withCronIdleClose<E extends BackendStreamEvent>(
 	source: AsyncIterable<E>,
@@ -196,7 +201,7 @@ export async function executeCronJob(
 	const jobOptsArg = Object.keys(jobOpts).length > 0 ? jobOpts : undefined;
 
 	try {
-		if (backendId === "claude") {
+		if (isClaudeBackend(backendId)) {
 			try {
 				await ensureFreshCliToken(log);
 			} catch (err) {
@@ -248,6 +253,8 @@ export async function executeCronJob(
 			result = await streamToTelegram(
 				client,
 				{
+					conversationId: cronConvId,
+					backend: backendId,
 					chatId,
 					messageThreadId: threadId,
 				},

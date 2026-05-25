@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { z } from "zod";
 
-const backendIdSchema = z.enum(["claude", "codex"]);
+const backendIdSchema = z.enum(["claude", "claude-v2", "codex"]);
 
 const configSchema = z.object({
 	telegramBotToken: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),

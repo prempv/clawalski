@@ -28,8 +28,8 @@ function mockLogger(): Logger {
 function makeCredentials(expiresAt: number) {
 	return {
 		claudeAiOauth: {
-			accessToken: "sk-ant-oat01-test",
-			refreshToken: "sk-ant-ort01-test",
+			accessToken: "oauth-access-token-test",
+			refreshToken: "oauth-refresh-token-test",
 			expiresAt,
 			scopes: ["user:inference", "user:profile"],
 			subscriptionType: "max",

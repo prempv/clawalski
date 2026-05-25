@@ -99,6 +99,23 @@ describe("ConversationLogger", () => {
 		expect(JSON.parse(lines[1] as string).input).toBe("after restart");
 	});
 
+	it("redacts sensitive values before writing durable logs", () => {
+		const logger = createConversationLogger(logDir);
+		logger.log(
+			makeEntry({
+				input: "Project Key: abcdefghijklmnopqrstuvwxyz",
+				output: "token=abcdefghijklmnopqrstuvwxyz",
+			}),
+		);
+
+		const convDir = join(logDir, "tg-dm-123");
+		const [filename] = readdirSync(convDir);
+		const content = readFileSync(join(convDir, filename as string), "utf-8");
+		const row = JSON.parse(content.trim());
+		expect(row.input).toBe("Project Key: [REDACTED]");
+		expect(row.output).toBe("token=[REDACTED]");
+	});
+
 	it("filename format matches expected pattern", () => {
 		const logger = createConversationLogger(logDir);
 		logger.log(makeEntry());

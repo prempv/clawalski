@@ -2,13 +2,37 @@ import type { ClaudeStreamEvent } from "./claude-bridge.js";
 import { summarizeToolInput } from "./claude-bridge.js";
 import type { Logger } from "./logger.js";
 import { markdownToTelegramHtml, splitHtml } from "./markdown-telegram.js";
+import { redactedPreview } from "./redaction.js";
 import type { RequestTimer } from "./request-timer.js";
 import type { TelegramClient } from "./telegram-client.js";
 
 export interface StreamingContext {
+	conversationId?: string;
+	backend?: string;
 	chatId: number;
 	messageThreadId?: number;
 	replyToMessageId?: number;
+}
+
+export interface TelegramDeliveryResult {
+	messageIds: number[];
+	chunks: number;
+	failedChunks: number;
+	fallbackChunks: number;
+}
+
+export interface StreamTurnResult {
+	turnIndex: number;
+	sessionId: string | null;
+	responseText: string;
+	toolHistory: string[];
+	error: string | null;
+	interrupted: boolean;
+	inputTokens: number | null;
+	outputTokens: number | null;
+	contextWindow: number | null;
+	model: string | null;
+	delivery: TelegramDeliveryResult;
 }
 
 export interface StreamResult {
@@ -38,9 +62,12 @@ export async function streamToTelegram(
 	log: Logger,
 	timer?: RequestTimer,
 	onEvent?: (event: ClaudeStreamEvent) => void,
+	onTurnComplete?: (turn: StreamTurnResult) => void | Promise<void>,
 ): Promise<StreamResult> {
 	log.info(
 		{
+			conversationId: ctx.conversationId,
+			backend: ctx.backend,
 			chatId: ctx.chatId,
 			threadId: ctx.messageThreadId,
 			replyToMessageId: ctx.replyToMessageId,
@@ -82,7 +109,9 @@ export async function streamToTelegram(
 	let lastEditTime = 0;
 	let currentTool = "";
 	let turnTools: string[] = [];
+	let turnErrorText: string | null = null;
 	let afterToolResult = false;
+	let turnIndex = 0;
 
 	// Aggregate state — preserved across turns and returned to the handler
 	// (for the conversation log + session stats).
@@ -99,7 +128,26 @@ export async function streamToTelegram(
 	let completed = false;
 	let interrupted = false;
 
-	const finalizeTurn = async (): Promise<void> => {
+	const notifyTurnComplete = async (turn: StreamTurnResult): Promise<void> => {
+		try {
+			await onTurnComplete?.(turn);
+		} catch (err) {
+			log.error(
+				{ err, conversationId: ctx.conversationId },
+				"turn completion observer failed",
+			);
+		}
+	};
+
+	const finalizeTurn = async (
+		reason: "turn_complete" | "stream_end",
+		turnTokens: {
+			inputTokens?: number | null;
+			outputTokens?: number | null;
+			contextWindow?: number | null;
+			sessionId?: string | null;
+		} = {},
+	): Promise<StreamTurnResult | null> => {
 		// Flush whatever is accumulated for this turn into a Telegram bubble.
 		// Called on every `turn_complete` and once more after the loop in case
 		// the iterator ended without a final turn_complete (codex / process
@@ -108,14 +156,15 @@ export async function streamToTelegram(
 			textSegments.push(currentSegment);
 			currentSegment = "";
 		}
-		if (textSegments.length === 0 && !errorText && !interrupted) return;
+		if (textSegments.length === 0 && !turnErrorText && !interrupted)
+			return null;
 
 		let finalText: string;
 		let finalSegments: string[];
-		if (errorText) {
+		if (turnErrorText) {
 			finalText = turnText
-				? `${truncate(turnText)}\n\n[Error: ${errorText}]`
-				: `Error: ${errorText}`;
+				? `${truncate(turnText)}\n\n[Error: ${turnErrorText}]`
+				: `Error: ${turnErrorText}`;
 			finalSegments = [finalText];
 		} else if (interrupted && textSegments.length === 0) {
 			finalText = STREAM_INTERRUPTED_MARKER;
@@ -125,7 +174,7 @@ export async function streamToTelegram(
 			finalSegments = textSegments;
 		}
 
-		await sendFinalResponse(
+		const delivery = await sendFinalResponse(
 			client,
 			ctx,
 			messageId,
@@ -133,6 +182,42 @@ export async function streamToTelegram(
 			finalSegments,
 			lastEditText,
 			log,
+		);
+		const completedTurn: StreamTurnResult = {
+			turnIndex: ++turnIndex,
+			sessionId: turnTokens.sessionId ?? sessionId,
+			responseText: turnText || finalText,
+			toolHistory: [...turnTools],
+			error: turnErrorText,
+			interrupted,
+			inputTokens: turnTokens.inputTokens ?? null,
+			outputTokens: turnTokens.outputTokens ?? null,
+			contextWindow: turnTokens.contextWindow ?? contextWindow,
+			model,
+			delivery,
+		};
+
+		log.info(
+			{
+				conversationId: ctx.conversationId,
+				backend: ctx.backend,
+				chatId: ctx.chatId,
+				threadId: ctx.messageThreadId,
+				sessionId: completedTurn.sessionId,
+				turnIndex: completedTurn.turnIndex,
+				reason,
+				responseLen: completedTurn.responseText.length,
+				responsePreview: redactedPreview(completedTurn.responseText),
+				toolCount: completedTurn.toolHistory.length,
+				messageIds: delivery.messageIds,
+				failedChunks: delivery.failedChunks,
+				fallbackChunks: delivery.fallbackChunks,
+				inputTokens: completedTurn.inputTokens,
+				outputTokens: completedTurn.outputTokens,
+				error: completedTurn.error,
+				interrupted: completedTurn.interrupted,
+			},
+			"stream turn complete",
 		);
 
 		// Reset per-turn state so the next continuation gets its own bubble.
@@ -144,7 +229,9 @@ export async function streamToTelegram(
 		lastEditTime = 0;
 		currentTool = "";
 		turnTools = [];
+		turnErrorText = null;
 		afterToolResult = false;
+		return completedTurn;
 	};
 
 	try {
@@ -202,10 +289,19 @@ export async function streamToTelegram(
 						if (event.outputTokens != null) outputTokens = event.outputTokens;
 						if (event.contextWindow != null)
 							contextWindow = event.contextWindow;
-						await finalizeTurn();
+						{
+							const turn = await finalizeTurn("turn_complete", {
+								sessionId: event.sessionId ?? sessionId,
+								inputTokens: event.inputTokens ?? null,
+								outputTokens: event.outputTokens ?? null,
+								contextWindow: event.contextWindow ?? null,
+							});
+							if (turn) await notifyTurnComplete(turn);
+						}
 						break;
 					case "error":
 						errorText = event.message;
+						turnErrorText = event.message;
 						if (event.sessionId) sessionId = event.sessionId;
 						break;
 					case "session_meta":
@@ -254,7 +350,15 @@ export async function streamToTelegram(
 		// exit, process death, error). For the normal Claude conversation
 		// path every turn is already flushed on `turn_complete`, so this is
 		// a no-op there.
-		await finalizeTurn();
+		{
+			const turn = await finalizeTurn("stream_end", {
+				sessionId,
+				inputTokens,
+				outputTokens,
+				contextWindow,
+			});
+			if (turn) await notifyTurnComplete(turn);
+		}
 
 		timer?.mark("response_sent");
 	} finally {
@@ -267,7 +371,7 @@ export async function streamToTelegram(
 			threadId: ctx.messageThreadId,
 			sessionId,
 			responseLen: aggregateText.length,
-			responsePreview: aggregateText.slice(0, 200),
+			responsePreview: redactedPreview(aggregateText),
 			toolCount: aggregateTools.length,
 			interrupted,
 			error: errorText,
@@ -306,10 +410,21 @@ async function sendOrEdit(
 			text: truncated,
 			...(ctx.messageThreadId && { message_thread_id: ctx.messageThreadId }),
 		});
+		log.debug(
+			{
+				conversationId: ctx.conversationId,
+				backend: ctx.backend,
+				chatId: ctx.chatId,
+				threadId: ctx.messageThreadId,
+				messageId: msg.message_id,
+				textLen: truncated.length,
+			},
+			"telegram interim message sent",
+		);
 		return msg.message_id;
 	}
 
-	await tryEdit(client, ctx.chatId, messageId, truncated, log);
+	await tryEdit(client, ctx, messageId, truncated, log);
 	return messageId;
 }
 
@@ -348,31 +463,31 @@ async function trySendHtml(
 	ctx: StreamingContext,
 	html: string,
 	log: Logger,
-): Promise<boolean> {
+): Promise<number | null> {
 	try {
-		await client.sendMessage({
+		const msg = await client.sendMessage({
 			chat_id: ctx.chatId,
 			text: html,
 			parse_mode: "HTML",
 			...(ctx.messageThreadId && { message_thread_id: ctx.messageThreadId }),
 		});
-		return true;
+		return msg.message_id;
 	} catch (err) {
 		log.warn({ err }, "HTML send failed, falling back to plain text");
-		return false;
+		return null;
 	}
 }
 
 async function tryEditHtml(
 	client: TelegramClient,
-	chatId: number,
+	ctx: StreamingContext,
 	messageId: number,
 	html: string,
 	log: Logger,
 ): Promise<boolean> {
 	try {
 		await client.editMessageText({
-			chat_id: chatId,
+			chat_id: ctx.chatId,
 			message_id: messageId,
 			text: html,
 			parse_mode: "HTML",
@@ -388,22 +503,35 @@ async function tryEditHtml(
 
 async function tryEdit(
 	client: TelegramClient,
-	chatId: number,
+	ctx: StreamingContext,
 	messageId: number,
 	text: string,
 	log: Logger,
-): Promise<void> {
+): Promise<boolean> {
 	try {
 		await client.editMessageText({
-			chat_id: chatId,
+			chat_id: ctx.chatId,
 			message_id: messageId,
 			text: truncate(text),
 		});
+		log.debug(
+			{
+				conversationId: ctx.conversationId,
+				backend: ctx.backend,
+				chatId: ctx.chatId,
+				threadId: ctx.messageThreadId,
+				messageId,
+				textLen: text.length,
+			},
+			"telegram interim message edited",
+		);
+		return true;
 	} catch (err) {
 		const msg = String(err);
 		if (!msg.includes("message is not modified")) {
 			log.debug({ err }, "edit message failed");
 		}
+		return msg.includes("message is not modified");
 	}
 }
 
@@ -415,7 +543,13 @@ async function sendFinalResponse(
 	segments: string[],
 	lastEditText: string,
 	log: Logger,
-): Promise<void> {
+): Promise<TelegramDeliveryResult> {
+	const delivery: TelegramDeliveryResult = {
+		messageIds: [],
+		chunks: 0,
+		failedChunks: 0,
+		fallbackChunks: 0,
+	};
 	// Build HTML with intermediate segments in expandable blockquotes
 	const html = buildFinalHtml(segments);
 	const chunks = splitHtml(html);
@@ -423,21 +557,36 @@ async function sendFinalResponse(
 	// Send first chunk: edit existing message or send new
 	const firstChunk = chunks[0];
 	if (firstChunk) {
+		delivery.chunks += 1;
 		if (messageId !== null) {
-			const edited = await tryEditHtml(
-				client,
-				ctx.chatId,
-				messageId,
-				firstChunk,
-				log,
-			);
+			const edited = await tryEditHtml(client, ctx, messageId, firstChunk, log);
 			if (!edited) {
-				await tryEdit(client, ctx.chatId, messageId, truncate(plainText), log);
+				delivery.fallbackChunks += 1;
+				if (await tryEdit(client, ctx, messageId, truncate(plainText), log)) {
+					delivery.messageIds.push(messageId);
+				} else {
+					delivery.failedChunks += 1;
+				}
+			} else {
+				delivery.messageIds.push(messageId);
 			}
 		} else {
 			const sent = await trySendHtml(client, ctx, firstChunk, log);
-			if (!sent) {
-				await trySendPlain(client, ctx, truncate(plainText), log);
+			if (sent) {
+				delivery.messageIds.push(sent);
+			} else {
+				delivery.fallbackChunks += 1;
+				const plainSent = await trySendPlain(
+					client,
+					ctx,
+					truncate(plainText),
+					log,
+				);
+				if (plainSent) {
+					delivery.messageIds.push(plainSent);
+				} else {
+					delivery.failedChunks += 1;
+				}
 			}
 		}
 	}
@@ -446,15 +595,27 @@ async function sendFinalResponse(
 	for (let i = 1; i < chunks.length; i++) {
 		const chunk = chunks[i];
 		if (!chunk) continue;
+		delivery.chunks += 1;
 		const sent = await trySendHtml(client, ctx, chunk, log);
-		if (!sent) {
+		if (sent) {
+			delivery.messageIds.push(sent);
+		} else {
+			delivery.fallbackChunks += 1;
 			const plainChunks = splitText(plainText, MAX_MESSAGE_LENGTH);
 			const plainChunk = plainChunks[i];
 			if (plainChunk) {
-				await trySendPlain(client, ctx, plainChunk, log);
+				const plainSent = await trySendPlain(client, ctx, plainChunk, log);
+				if (plainSent) {
+					delivery.messageIds.push(plainSent);
+				} else {
+					delivery.failedChunks += 1;
+				}
+			} else {
+				delivery.failedChunks += 1;
 			}
 		}
 	}
+	return delivery;
 }
 
 async function trySendPlain(
@@ -462,15 +623,17 @@ async function trySendPlain(
 	ctx: StreamingContext,
 	text: string,
 	log: Logger,
-): Promise<void> {
+): Promise<number | null> {
 	try {
-		await client.sendMessage({
+		const msg = await client.sendMessage({
 			chat_id: ctx.chatId,
 			text,
 			...(ctx.messageThreadId && { message_thread_id: ctx.messageThreadId }),
 		});
+		return msg.message_id;
 	} catch (err) {
 		log.warn({ err }, "plain text send failed");
+		return null;
 	}
 }
 

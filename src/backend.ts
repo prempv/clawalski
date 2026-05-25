@@ -1,10 +1,15 @@
 import type { RelayEvent } from "claude-code-parser";
+import type { Logger } from "./logger.js";
 import type { RequestTimer } from "./request-timer.js";
 import type { ContentBlock } from "./types.js";
 
-export type BackendId = "claude" | "codex";
+export type BackendId = "claude" | "claude-v2" | "codex";
 
-export const BACKEND_IDS: readonly BackendId[] = ["claude", "codex"] as const;
+export const BACKEND_IDS: readonly BackendId[] = [
+	"claude",
+	"claude-v2",
+	"codex",
+] as const;
 
 export function isBackendId(value: string): value is BackendId {
 	return (BACKEND_IDS as readonly string[]).includes(value);
@@ -19,6 +24,10 @@ export interface BackendBridgeOptions {
 	conversationHistoryDir?: string;
 	/** Absolute path to crons.json — granted --rw in the sandbox so the /cron skill can edit it. */
 	cronFilePath?: string;
+	/** Absolute path for backend-specific runtime state. */
+	stateDir?: string;
+	/** Optional process logger for backend-specific lifecycle diagnostics. */
+	log?: Logger;
 }
 
 /** Stream event shape exposed to the renderer. */

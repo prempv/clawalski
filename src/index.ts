@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { serve } from "@hono/node-server";
 import Database from "better-sqlite3";
 import { loadAccessConfig, watchAccessConfig } from "./access.js";
@@ -16,6 +16,7 @@ import type {
 import { loadBindingConfig } from "./binding-config.js";
 import { ProcessPool } from "./claude-bridge.js";
 import type { HandleUpdateOptions } from "./claude-handler.js";
+import { ClaudeInteractiveProcessPool } from "./claude-interactive-bridge.js";
 import { CodexCronProcessPool, CodexProcessPool } from "./codex-bridge.js";
 import { type Config, loadConfig } from "./config.js";
 import {
@@ -62,7 +63,7 @@ export async function runInstance({
 	log.info({ bot: me.username, name: me.first_name }, "authenticated");
 
 	let access = loadAccessConfig(config.accessFile, log);
-	watchAccessConfig(
+	const stopAccessWatch = watchAccessConfig(
 		config.accessFile,
 		(updated) => {
 			access = updated;
@@ -98,24 +99,33 @@ export async function runInstance({
 		workingDir: config.claudeWorkingDir,
 		model: config.claudeModel,
 		cronFilePath: config.cronFile,
+		stateDir: join(config.instancePath, "data/claude-v2"),
+		log,
 	};
 	const codexOpts: BackendBridgeOptions = {
 		workingDir: config.claudeWorkingDir,
 		model: config.codexModel,
 		cronFilePath: config.cronFile,
+		log,
 	};
 
 	const claudePool = new ProcessPool(claudeOpts);
+	const claudeV2Pool = new ClaudeInteractiveProcessPool(claudeOpts);
 	const codexPool = new CodexProcessPool(codexOpts);
 	const claudeCronPool = new CronProcessPool(claudeOpts);
+	// Cron runs are intentionally one-shot; the v2 Telegram backend is
+	// interactive/tmux-only, so cron keeps using Claude's stream-json path.
+	const claudeV2CronPool = new CronProcessPool(claudeOpts);
 	const codexCronPool = new CodexCronProcessPool(codexOpts);
 
 	const backendPools = new Map<BackendId, BackendPool>([
 		["claude", claudePool],
+		["claude-v2", claudeV2Pool],
 		["codex", codexPool],
 	]);
 	const backendCronPools = new Map<BackendId, BackendCronPool>([
 		["claude", claudeCronPool],
+		["claude-v2", claudeV2CronPool],
 		["codex", codexCronPool],
 	]);
 	const backends = new DefaultBackendRegistry(
@@ -156,7 +166,7 @@ export async function runInstance({
 		log,
 	});
 
-	watchCronConfig(
+	const stopCronWatch = watchCronConfig(
 		config.cronFile,
 		(updated) => {
 			cronConfig = updated;
@@ -194,6 +204,8 @@ export async function runInstance({
 			notifyStopping();
 			stopWatchdog();
 			ac.abort();
+			stopAccessWatch();
+			stopCronWatch();
 			cronScheduler.stop();
 			backends.closeAll();
 			sessionStore.close();
@@ -258,6 +270,8 @@ async function registerCronCommands(
 	// underscores; the parser accepts both `_` and `-` for forgiveness.
 	const commands = [
 		{ command: "new_claude", description: "Start fresh — use Claude" },
+		{ command: "new_claude_v2", description: "Start fresh — use Claude v2" },
+		{ command: "new_claudev2", description: "Start fresh — use Claude v2" },
 		{ command: "new_codex", description: "Start fresh — use Codex" },
 		{ command: "stats", description: "Show session statistics" },
 		{ command: "cron", description: "Manage cron jobs" },
@@ -271,7 +285,7 @@ async function registerCronCommands(
 	try {
 		await client.setMyCommands(commands);
 		log.info(
-			{ count: commands.length, cron: commands.length - 4 },
+			{ count: commands.length, cron: commands.length - 6 },
 			"registered bot commands",
 		);
 	} catch (err) {

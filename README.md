@@ -1,6 +1,6 @@
 # clawalski
 
-Path-addressed Telegram bot gateway to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI subprocesses. Each instance is a free-standing directory; install once, scaffold instances anywhere, run them as systemd user services. Forked from the reference [telegram-gateway](https://github.com/prempv/telegram-gateway).
+Path-addressed Telegram bot gateway to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI subprocesses. Each instance is a free-standing directory; install once, scaffold instances anywhere, run them as systemd user services. Originally derived from the same maintainer's telegram-gateway prototype.
 
 ## Install
 
@@ -154,7 +154,7 @@ The full set of overrides is read from `config/.env`. Most users only need `TELE
 | `MODE` | `polling` | `polling` or `webhook` |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `RESPOND_MODE` | `all` | `all` or `mention` (groups: only @-mentions) |
-| `DEFAULT_BACKEND` | `claude` | `claude` or `codex` |
+| `DEFAULT_BACKEND` | `claude` | `claude`, `claude-v2`, or `codex` |
 | `CLAUDE_MODEL` | *(default)* | e.g. `sonnet`, `opus`, `haiku` |
 | `CODEX_MODEL` | *(default)* | Override for codex backend |
 | `CRON_RETRY_MAX_ATTEMPTS` | `3` | Per-run transient retry cap |
@@ -162,6 +162,8 @@ The full set of overrides is read from `config/.env`. Most users only need `TELE
 | `CRON_FAILURE_ALERT_AFTER` | `2` | Alert after N consecutive failures |
 | `CRON_FAILURE_ALERT_COOLDOWN_MS` | `3600000` | Min gap between alerts per job |
 | `CRON_AUTO_DISABLE_AFTER` | `5` | Auto-disable after N consecutive failures |
+
+Claude and Codex subprocesses are launched with their non-interactive permission-bypass flags so Telegram sessions do not block on terminal prompts. Run with strict allowlists and a working directory you trust Telegram senders to read and modify.
 
 Webhook-only:
 

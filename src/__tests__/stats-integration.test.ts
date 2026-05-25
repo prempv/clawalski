@@ -133,10 +133,12 @@ function mockBackends(
 ): BackendRegistry {
 	const pools = new Map<BackendId, BackendPool>([
 		["claude", mockPool("claude", procFactory)],
+		["claude-v2", mockPool("claude-v2", procFactory)],
 		["codex", mockPool("codex", procFactory)],
 	]);
 	const cronPools = new Map<BackendId, BackendCronPool>([
 		["claude", mockCronPool("claude")],
+		["claude-v2", mockCronPool("claude-v2")],
 		["codex", mockCronPool("codex")],
 	]);
 	return {
@@ -426,10 +428,16 @@ describe("/stats end-to-end integration", () => {
 			remove: vi.fn(),
 			closeAll: vi.fn(),
 		} as unknown as BackendPool;
+		const claudeV2Pool = mockPool("claude-v2");
 		const codexPool = mockPool("codex");
 		const backends: BackendRegistry = {
 			defaultId: "claude",
-			pool: (id: BackendId) => (id === "claude" ? claudePool : codexPool),
+			pool: (id: BackendId) =>
+				id === "claude"
+					? claudePool
+					: id === "claude-v2"
+						? claudeV2Pool
+						: codexPool,
 			cronPool: (_id: BackendId) =>
 				({}) as unknown as ReturnType<BackendRegistry["cronPool"]>,
 			closeAll: vi.fn(),

@@ -30,6 +30,7 @@ Each clawalski instance directory contains:
 - Set `adminChatId` in `access.json` so unauthorized-access alerts go somewhere.
 - Run each instance under a separate Telegram bot (separate token), not a shared one.
 - The systemd unit emitted by `service install` runs under your user account; the spawned Claude processes inherit that scope. Don't point `workingDir` at directories you wouldn't trust the bot's senders to read or modify.
+- Claude and Codex backends use non-interactive permission-bypass flags by default. Treat every allowlisted Telegram sender as able to delegate agent work inside the configured `workingDir`.
 
 ## Updating
 

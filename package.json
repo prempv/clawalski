@@ -2,6 +2,7 @@
   "name": "clawalski",
   "version": "0.1.0",
   "description": "Telegram bot gateway to Claude Code CLI — installable, path-addressed, runs as a systemd user service.",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "clawalski": "dist/cli.js"
@@ -30,11 +31,11 @@
   },
   "homepage": "https://github.com/prempv/clawalski",
   "dependencies": {
-    "@hono/node-server": "^1.13.8",
+    "@hono/node-server": "^1.19.14",
     "better-sqlite3": "^12.8.0",
     "claude-code-parser": "^0.1.1",
     "croner": "^10.0.1",
-    "hono": "^4.7.6",
+    "hono": "^4.12.23",
     "pino": "^9.6.0",
     "telegram-markdown-formatter": "^0.1.2",
     "zod": "^3.24.3"
