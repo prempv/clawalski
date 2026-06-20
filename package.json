@@ -35,7 +35,7 @@
     "better-sqlite3": "^12.8.0",
     "claude-code-parser": "^0.1.1",
     "croner": "^10.0.1",
-    "hono": "^4.12.23",
+    "hono": "^4.12.25",
     "pino": "^9.6.0",
     "telegram-markdown-formatter": "^0.1.2",
     "zod": "^3.24.3"
